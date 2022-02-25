@@ -1,0 +1,12 @@
+syntax = "proto3";
+package notionallabs.magenft.magenft;
+
+import "gogoproto/gogo.proto";
+
+option go_package = "github.com/notional-labs/MageNFT/x/magenft/types";
+
+// Params defines the parameters for the module.
+message Params {
+  option (gogoproto.goproto_stringer) = false;
+  
+}
