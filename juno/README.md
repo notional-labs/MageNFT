@@ -1,0 +1,1 @@
+Juno contracts for issuing cw20 token
