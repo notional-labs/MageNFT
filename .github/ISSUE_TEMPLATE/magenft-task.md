@@ -1,5 +1,5 @@
 ---
-name: Anone Task
+name: MageNFT Task
 about: Create a task for the whole team
 title: ''
 labels: task
