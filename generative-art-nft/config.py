@@ -21,36 +21,43 @@
 # Be sure to check out the tutorial in the README for more details.                
 
 CONFIG = [
-    {
+	{
         'id': 1,
+        'name': 'background',
+        'directory': 'background',
+        'required': True,
+        'rarity_weights': None,
+    },
+    {
+        'id': 2,
         'name': 'outfit',
         'directory': 'outfit',
         'required': True,
         'rarity_weights': None,
     },
     {
-        'id': 2,
+        'id': 3,
         'name': 'head',
         'directory': 'head',
         'required': True,
         'rarity_weights': None,
     },
     {
-        'id': 3,
+        'id': 4,
         'name': 'hat',
         'directory': 'hat',
         'required': True,
         'rarity_weights': None,
     },
     {
-        'id': 4,
+        'id': 5,
         'name': 'magic',
         'directory': 'magic',
         'required': True,
         'rarity_weights': None,
     },
     {
-        'id': 5,
+        'id': 6,
         'name': 'stick',
         'directory': 'stick',
         'required': True,
