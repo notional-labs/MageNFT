@@ -1,1 +1,0 @@
-/media/hieuvu/New\ Volume1/Notion-lab/MageNFT/stargaze/target/debug/libsg_utils.rlib: /media/hieuvu/New\ Volume1/Notion-lab/MageNFT/stargaze/packages/sg-utils/src/bech32_convert.rs /media/hieuvu/New\ Volume1/Notion-lab/MageNFT/stargaze/packages/sg-utils/src/lib.rs
