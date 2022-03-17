@@ -1,0 +1,16 @@
+/media/hieuvu/New Volume1/Notion-lab/MageNFT/stargaze/target/debug/deps/libcw721_base-fad1909befd1ed36.so: /home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/lib.rs /home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/contract_tests.rs /home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/error.rs /home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/execute.rs /home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/helpers.rs /home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/msg.rs /home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/query.rs /home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/state.rs
+
+/media/hieuvu/New Volume1/Notion-lab/MageNFT/stargaze/target/debug/deps/libcw721_base-fad1909befd1ed36.rlib: /home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/lib.rs /home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/contract_tests.rs /home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/error.rs /home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/execute.rs /home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/helpers.rs /home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/msg.rs /home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/query.rs /home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/state.rs
+
+/media/hieuvu/New Volume1/Notion-lab/MageNFT/stargaze/target/debug/deps/cw721_base-fad1909befd1ed36.d: /home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/lib.rs /home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/contract_tests.rs /home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/error.rs /home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/execute.rs /home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/helpers.rs /home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/msg.rs /home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/query.rs /home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/state.rs
+
+/home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/lib.rs:
+/home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/contract_tests.rs:
+/home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/error.rs:
+/home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/execute.rs:
+/home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/helpers.rs:
+/home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/msg.rs:
+/home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/query.rs:
+/home/hieuvu/.cargo/registry/src/github.com-1ecc6299db9ec823/cw721-base-0.12.0/src/state.rs:
+
+# env-dep:CARGO_PKG_VERSION=0.12.0

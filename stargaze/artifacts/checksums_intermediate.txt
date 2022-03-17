@@ -1,0 +1,4 @@
+cfd09d6fc9ab0d492c76a67baf588ba811f7132df866a866f918a7a530e58939  ./target/wasm32-unknown-unknown/release/minter.wasm
+5479b8eb5cfec1df9d14c5031f9519d192e0ec42f9ae565751f609ced582bde4  ./target/wasm32-unknown-unknown/release/royalty_group.wasm
+420fa18355b91927c15fbfbef5eb4b53f7dcb6cefa6622102e2cf971862e70ac  ./target/wasm32-unknown-unknown/release/sg721.wasm
+7d8c4c018cf371cb19a022821559bd65dd8cc63d2256cd902780cfadd77d1564  ./target/wasm32-unknown-unknown/release/whitelist.wasm
