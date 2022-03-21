@@ -14,6 +14,7 @@
     "files-from-path": "^0.2.3",
     "fs": "^0.0.1-security",
     "inquirer": "^8.2.0",
+    "ipfs": "^0.62.1",
     "ipfs-car": "^0.6.1",
     "mime": "^3.0.0",
     "nft.storage": "^6.0.0",
@@ -36,6 +37,7 @@
     "whitelist-file": "ts-node scripts/whitelist-file.ts",
     "gen-metadata": "ts-node scripts/gen-metadata.ts",
     "clean-metadata": "ts-node scripts/clean-metadata.ts",
-    "clean-images": "ts-node scripts/clean-images.ts"
+    "clean-images": "ts-node scripts/clean-images.ts",
+    "ipns": "ts-node scripts/ipns.ts"
   }
 }
