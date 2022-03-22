@@ -34,7 +34,7 @@ yarn clean-images
 yarn clean-metadata
 ```
 
-## Move the images into the 'images' folder and upload to ipfs
+## After gen image and metadata from generative-art-nft. Move the images into the 'images' folder, csv file to csv folder and upload to ipfs
 ```sh
 yarn nft-storage-upload
 ```
