@@ -66,17 +66,17 @@ module.exports = {
   
     //// MINTER CONTRACT ////
     // The base URI to be used to programatically mint tokens
-    baseTokenUri: 'ipns://k51qzi5uqu5dkf2vg52t31za1pxqsjyn5ifj6meipphr8novezbostrgu6f3xl',
+    baseTokenUri: 'ipfs://bafybeigs7howsgqe3ntpijxts3sfktitwvbwgsu5vkjzxxo4bj2nwkpsxi/galaxyKdFijL',
     // The number of tokens to mint
     numTokens: 5,
     // The price (in STARS) for your NFTs (minimum 50 STARS)
     unitPrice: 50,
     // The max amount of NFTs an address can mint
-    perAddressLimit: 1,
+    perAddressLimit: 5,
     // The date when the sale goes live
     // If whitelist is enabled, only whitelisted addresses will be able to purchase
     // startTime in ISO format
-    startTime: '2022-03-21T15:00:00.000Z',
+    startTime: '2022-03-22T10:30:00.000Z',
     // The minter contract address
     // Get this after running `yarn minter`
     minter: 'stars1...',

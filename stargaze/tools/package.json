@@ -38,6 +38,7 @@
     "gen-metadata": "ts-node scripts/gen-metadata.ts",
     "clean-metadata": "ts-node scripts/clean-metadata.ts",
     "clean-images": "ts-node scripts/clean-images.ts",
-    "ipns": "ts-node scripts/ipns.ts"
+    "ipns": "ts-node scripts/ipns.ts",
+    "convert": "ts-node scripts/csv-to-metadata"
   }
 }
