@@ -43,6 +43,6 @@ export default class GenerateProof extends Command {
 
     let airdrop = new Airdrop(receivers)
     let proof = airdrop.getMerkleProof({address: flags.address, amount: flags.amount})
-    console.log(proof)
+    console.log(JSON.stringify(proof))
   }
 }
