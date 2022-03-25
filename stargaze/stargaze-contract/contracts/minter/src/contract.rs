@@ -65,10 +65,10 @@ pub fn instantiate(
     }
 
     // Check that base_token_uri is a valid IPFS uri
-    let parsed_token_uri = Url::parse(&msg.base_token_uri)?;
-    if parsed_token_uri.scheme() != "ipfs" {
-        return Err(ContractError::InvalidBaseTokenURI {});
-    }
+    // let parsed_token_uri = Url::parse(&msg.base_token_uri)?;
+    // if parsed_token_uri.scheme() != "ipfs" {
+    //     return Err(ContractError::InvalidBaseTokenURI {});
+    // }
 
     if NATIVE_DENOM != msg.unit_price.denom {
         return Err(ContractError::InvalidDenom {
