@@ -34,9 +34,16 @@ yarn clean-images
 yarn clean-metadata
 ```
 
-## After gen image and metadata from generative-art-nft. Move the images into the 'images' folder, csv file to csv folder and upload to ipfs
+## After gen image and metadata from generative-art-nft. The 2 option for user: 
+
+## Upload and save to local
 ```sh
-yarn nft-storage-upload
+yarn nft-storage-upload --edition <edition_name_created>
+```
+
+## Just upload directly
+```sh
+yarn nft-storage-upload --edition <edition_name_created> --clear
 ```
 
 ## After getting the baseTokenUri from the above step, pass it to the config.js file. Modify the collection properties and run the command to initialize an NFT minting contract
