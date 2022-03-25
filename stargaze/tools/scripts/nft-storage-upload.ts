@@ -13,14 +13,15 @@ const config = require('../config');
 const token = config.nftStorageApiKey;
 const client = new NFTStorage({ token });
 
-export async function nftStorageUpload() {
+export async function nftStorageUpload(edition_name: string, clear: boolean) {
   // Config
   console.log(
     'Deploying files to IPFS via NFT.storage using the following configuration:'
   );
   console.log(config);
 
-  const imagesBasePath = path.join(__dirname, '../images');
+  const imagesBasePath = path.join(__dirname, `../../../generative-art-nft/output/edition ${edition_name}/images`);
+  const csvBasePath = path.join(__dirname, `../../../generative-art-nft/output/edition ${edition_name}/metadata.csv`);
 
   // Get list of images and metadata
   const images = fs.readdirSync(imagesBasePath);
@@ -41,7 +42,7 @@ export async function nftStorageUpload() {
   const tmpFolder = fs.mkdtempSync(path.join(os.tmpdir(), 'galaxy'));
 
   // Get metadata from csv file
-  const csv = fs.readFileSync('csv/metadata.csv');
+  const csv = fs.readFileSync(csvBasePath);
   const bufferString = csv.toString();
   const rows = bufferString.split('\n');
   const headers = rows[0].split(',');
@@ -80,47 +81,6 @@ export async function nftStorageUpload() {
     fs.writeFileSync(`${tmpFolder}/${data[0]}`, jsonData);
   }
 
-  // Update metadata with IPFS hashes
-  // images.map(async (file, index: number) => {
-
-  //   const fileName = getName(file)
-  //   const metadata = {
-  //     attributes: [
-  //       {
-  //         trait_type: "hat",
-  //         "value": "bandana"
-  //       },
-  //       {
-  //         trait_type: "glasses",
-  //         "value": "sunglasses"
-  //       },
-  //       {
-  //         trait_type: "personality",
-  //         "value": "chill"
-  //       },
-  //       {
-  //         trait_type: "shirt_color",
-  //         "value": "purple"
-  //       },
-  //       {
-  //         display_type: "number",
-  //         trait_type: "generation",
-  //         value: 1
-  //       }
-  //     ],
-  //     description: `Auto genesis metadata ${fileName}`,
-  //     external_url: `https://example.com/?token_id=${fileName}`,
-  //     image: `ipfs://${imagesBaseUri}/images/${images[index]}`,
-  //     name: "Shane Stargaze"
-  //   }
-  //   const jsonData = JSON.stringify(metadata);
-  //   fs.writeFileSync(`metadata/${fileName}`, jsonData);
-
-  //   // Write updated metadata to tmp folder
-  //   // We add 1, because token IDs start at 1
-  //   fs.writeFileSync(`${tmpFolder}/${index + 1}`, jsonData);
-  // });
-
   // Upload tmpFolder
   const files = await getFilesFromPath(tmpFolder);
   const result = await client.storeDirectory(files as any);
@@ -131,6 +91,11 @@ export async function nftStorageUpload() {
   // Set base token uri
   const baseTokenUri = `ipfs://${result}/${projectPath}`;
 
+  if(clear) {
+    clearImages(edition_name);
+    clearMetadata();
+  }
+
   console.log('Images ipfs uri: ', `ipfs://${imagesBaseUri}/images`)
   console.log('Set this field in your config.js file: ');
   console.log('baseTokenUri: ', baseTokenUri);
@@ -140,8 +105,30 @@ export async function nftStorageUpload() {
   };
 }
 
+export function clearImages(edition_name: string) {
+  const imagesBasePath = path.join(__dirname, `../../../generative-art-nft/output/edition ${edition_name}/images`);
+  const files = fs.readdirSync(imagesBasePath);
+  files.map((file) => {
+      fs.unlinkSync(`${imagesBasePath}/${file}`);
+  })
+}
+
+export function clearMetadata() {
+  const files = fs.readdirSync('metadata/');
+  files.map((file) => {
+      fs.unlinkSync(`metadata/${file}`);
+  })
+}
+
 export function getName(dir: string): string {
   return dir.split('.')[0];
 }
 
-nftStorageUpload();
+const args = process.argv.slice(2);
+if (args.length == 0) {
+  console.log('No arguments provided, need --edition');
+} else if (args.length == 2 && args[0] == '--edition') {
+  nftStorageUpload(args[1], false);
+} else if (args.length == 3 && args[0] == '--edition' && args[2] == '--clear') {
+  nftStorageUpload(args[1], true);
+} 
