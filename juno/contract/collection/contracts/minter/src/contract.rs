@@ -5,22 +5,22 @@ use cosmwasm_std::{
     MessageInfo, Order, Reply, ReplyOn, StdError, StdResult, Timestamp, Uint128, WasmMsg,
 };
 use cw2::set_contract_version;
-use cw721::TokensResponse as Cw721TokensResponse;
 use cw721_base::{msg::ExecuteMsg as Cw721ExecuteMsg, MintMsg};
-use cw_utils::{may_pay, parse_reply_instantiate_data, Expiration};
-use sg721::msg::{InstantiateMsg as Sg721InstantiateMsg, QueryMsg as Sg721QueryMsg};
+use cw_utils::{may_pay, parse_reply_instantiate_data};
+use sg721::msg::InstantiateMsg as Sg721InstantiateMsg;
 use url::Url;
 
 use crate::error::ContractError;
 use crate::msg::{
-    ConfigResponse, ExecuteMsg, InstantiateMsg, MintPriceResponse, MintableNumTokensResponse,
-    QueryMsg, StartTimeResponse,
+    ConfigResponse, ExecuteMsg, InstantiateMsg, MintCountResponse, MintPriceResponse,
+    MintableNumTokensResponse, QueryMsg, StartTimeResponse,
 };
-use crate::state::{Config, CONFIG, MINTABLE_TOKEN_IDS, SG721_ADDRESS};
+use crate::state::{
+    Config, CONFIG, MINTABLE_NUM_TOKENS, MINTABLE_TOKEN_IDS, MINTER_ADDRS, SG721_ADDRESS,
+};
 use sg_std::{burn_and_distribute_fee, StargazeMsgWrapper, GENESIS_MINT_START_TIME, NATIVE_DENOM};
 use whitelist::msg::{
     ConfigResponse as WhitelistConfigResponse, HasMemberResponse, QueryMsg as WhitelistQueryMsg,
-    UnitPriceResponse,
 };
 
 pub type Response = cosmwasm_std::Response<StargazeMsgWrapper>;
@@ -34,8 +34,7 @@ const INSTANTIATE_SG721_REPLY_ID: u64 = 1;
 
 // governance parameters
 const MAX_TOKEN_LIMIT: u32 = 10000;
-const MAX_PER_ADDRESS_LIMIT: u32 = 30;
-const STARTING_PER_ADDRESS_LIMIT: u32 = 5;
+const MAX_PER_ADDRESS_LIMIT: u32 = 50;
 const MIN_MINT_PRICE: u128 = 50_000_000;
 const MINT_FEE_PERCENT: u32 = 10;
 
@@ -48,34 +47,38 @@ pub fn instantiate(
 ) -> Result<Response, ContractError> {
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
 
-    if msg.num_tokens > MAX_TOKEN_LIMIT.into() {
-        return Err(ContractError::MaxTokenLimitExceeded {
+    // Check the number of tokens is more than zero and less than the max limit
+    if msg.num_tokens == 0 || msg.num_tokens > MAX_TOKEN_LIMIT {
+        return Err(ContractError::InvalidNumTokens {
+            min: 1,
             max: MAX_TOKEN_LIMIT,
         });
     }
 
-    if let Some(per_address_limit) = msg.per_address_limit {
-        // Check per address limit is valid
-        if per_address_limit > MAX_PER_ADDRESS_LIMIT {
-            return Err(ContractError::InvalidPerAddressLimit {
-                max: MAX_PER_ADDRESS_LIMIT.to_string(),
-                got: per_address_limit.to_string(),
-            });
-        }
+    // Check per address limit is valid
+    if msg.per_address_limit == 0 || msg.per_address_limit > MAX_PER_ADDRESS_LIMIT {
+        return Err(ContractError::InvalidPerAddressLimit {
+            max: MAX_PER_ADDRESS_LIMIT,
+            min: 1,
+            got: msg.per_address_limit,
+        });
     }
 
     // Check that base_token_uri is a valid IPFS uri
-    let parsed_token_uri = Url::parse(&msg.base_token_uri)?;
-    if parsed_token_uri.scheme() != "ipfs" {
-        return Err(ContractError::InvalidBaseTokenURI {});
-    }
+    // let parsed_token_uri = Url::parse(&msg.base_token_uri)?;
+    // if parsed_token_uri.scheme() != "ipfs" {
+    //     return Err(ContractError::InvalidBaseTokenURI {});
+    // }
 
+    // Check that the price is in the correct denom ('ustars')
     if NATIVE_DENOM != msg.unit_price.denom {
         return Err(ContractError::InvalidDenom {
             expected: NATIVE_DENOM.to_string(),
-            got: msg.unit_price.denom.to_string(),
+            got: msg.unit_price.denom,
         });
     }
+
+    // Check that the price is greater than the minimum
     if MIN_MINT_PRICE > msg.unit_price.amount.into() {
         return Err(ContractError::InsufficientMintPrice {
             expected: MIN_MINT_PRICE,
@@ -83,26 +86,23 @@ pub fn instantiate(
         });
     }
 
-    // Initially set per_address_limit if no msg
-    let per_address_limit: Option<u32> = msg.per_address_limit.or(Some(STARTING_PER_ADDRESS_LIMIT));
+    let genesis_time = Timestamp::from_nanos(GENESIS_MINT_START_TIME);
+    // If start time is before genesis time return error
+    if msg.start_time < genesis_time {
+        return Err(ContractError::BeforeGenesisTime {});
+    }
+    // If current time is beyond the provided start time return error
+    if env.block.time > msg.start_time {
+        return Err(ContractError::InvalidStartTime(
+            msg.start_time,
+            env.block.time,
+        ));
+    }
 
-    let whitelist_addr: Option<Addr> = match msg.whitelist {
-        Some(wl) => Some(deps.api.addr_validate(&wl)?),
-        None => None,
-    };
-
-    // default is genesis mint start time
-    let default_start_time = Expiration::AtTime(Timestamp::from_nanos(GENESIS_MINT_START_TIME));
-    let start_time = match msg.start_time {
-        Some(st) => {
-            if st < default_start_time {
-                default_start_time
-            } else {
-                st
-            }
-        }
-        None => default_start_time,
-    };
+    // Validate address for the optional whitelist contract
+    let whitelist_addr = msg
+        .whitelist
+        .and_then(|w| deps.api.addr_validate(w.as_str()).ok());
 
     let config = Config {
         admin: info.sender.clone(),
@@ -110,17 +110,19 @@ pub fn instantiate(
         num_tokens: msg.num_tokens,
         sg721_code_id: msg.sg721_code_id,
         unit_price: msg.unit_price,
-        per_address_limit,
+        per_address_limit: msg.per_address_limit,
         whitelist: whitelist_addr,
-        start_time: Some(start_time),
+        start_time: msg.start_time,
     };
     CONFIG.save(deps.storage, &config)?;
+    MINTABLE_NUM_TOKENS.save(deps.storage, &msg.num_tokens)?;
 
-    // save mintable token ids map
+    // Save mintable token ids map
     for token_id in 1..=msg.num_tokens {
-        MINTABLE_TOKEN_IDS.save(deps.storage, token_id, &Empty {})?;
+        MINTABLE_TOKEN_IDS.save(deps.storage, token_id, &true)?;
     }
 
+    // Submessage to instantiate sg721 contract
     let sub_msgs: Vec<SubMsg> = vec![SubMsg {
         msg: WasmMsg::Instantiate {
             code_id: msg.sg721_code_id,
@@ -128,7 +130,7 @@ pub fn instantiate(
                 name: msg.sg721_instantiate_msg.name,
                 symbol: msg.sg721_instantiate_msg.symbol,
                 minter: env.contract.address.to_string(),
-                config: msg.sg721_instantiate_msg.config,
+                collection_info: msg.sg721_instantiate_msg.collection_info,
             })?,
             funds: info.funds,
             admin: Some(info.sender.to_string()),
@@ -157,9 +159,7 @@ pub fn execute(
 ) -> Result<Response, ContractError> {
     match msg {
         ExecuteMsg::Mint {} => execute_mint_sender(deps, env, info),
-        ExecuteMsg::UpdateStartTime(expiration) => {
-            execute_update_start_time(deps, env, info, expiration)
-        }
+        ExecuteMsg::UpdateStartTime(time) => execute_update_start_time(deps, env, info, time),
         ExecuteMsg::UpdatePerAddressLimit { per_address_limit } => {
             execute_update_per_address_limit(deps, env, info, per_address_limit)
         }
@@ -176,7 +176,7 @@ pub fn execute(
 
 pub fn execute_set_whitelist(
     deps: DepsMut,
-    _env: Env,
+    env: Env,
     info: MessageInfo,
     whitelist: &str,
 ) -> Result<Response, ContractError> {
@@ -186,6 +186,21 @@ pub fn execute_set_whitelist(
             "Sender is not an admin".to_owned(),
         ));
     };
+
+    if env.block.time >= config.start_time {
+        return Err(ContractError::AlreadyStarted {});
+    }
+
+    if let Some(wl) = config.whitelist {
+        let res: WhitelistConfigResponse = deps
+            .querier
+            .query_wasm_smart(wl, &WhitelistQueryMsg::Config {})?;
+
+        if res.is_active {
+            return Err(ContractError::WhitelistAlreadyStarted {});
+        }
+    }
+
     config.whitelist = Some(deps.api.addr_validate(whitelist)?);
     CONFIG.save(deps.storage, &config)?;
 
@@ -200,82 +215,71 @@ pub fn execute_mint_sender(
     info: MessageInfo,
 ) -> Result<Response, ContractError> {
     let config = CONFIG.load(deps.storage)?;
-    let sg721_address = SG721_ADDRESS.load(deps.storage)?;
     let action = "mint_sender";
-    let mut pub_mint: bool = false;
 
-    // check if a whitelist exists and not ended
-    // sender has to be whitelisted to mint
-    if let Some(whitelist) = config.whitelist {
-        let wl_config: WhitelistConfigResponse = deps
-            .querier
-            .query_wasm_smart(whitelist.clone(), &WhitelistQueryMsg::Config {})?;
-
-        if wl_config.is_active {
-            let res: HasMemberResponse = deps.querier.query_wasm_smart(
-                whitelist,
-                &WhitelistQueryMsg::HasMember {
-                    member: info.sender.to_string(),
-                },
-            )?;
-            if !res.has_member {
-                return Err(ContractError::NotWhitelisted {
-                    addr: info.sender.to_string(),
-                });
-            }
-            // check wl per address limit
-            let tokens: Cw721TokensResponse = deps.querier.query_wasm_smart(
-                sg721_address.to_string(),
-                &Sg721QueryMsg::Tokens {
-                    owner: info.sender.to_string(),
-                    start_after: None,
-                    limit: Some(wl_config.per_address_limit as u32),
-                },
-            )?;
-            if tokens.tokens.len() >= wl_config.per_address_limit as usize {
-                return Err(ContractError::MaxPerAddressLimitExceeded {});
-            }
-        } else {
-            pub_mint = true;
-        }
-    } else {
-        pub_mint = true;
-    }
-
-    // if there is no active whitelist right now, check public mint
-    if pub_mint {
-        if let Some(start_time) = config.start_time {
-            // Check if after start_time
-            if !start_time.is_expired(&env.block) {
-                return Err(ContractError::BeforeMintStartTime {});
-            }
-        }
+    // If there is no active whitelist right now, check public mint
+    // Check if after start_time
+    if is_public_mint(deps.as_ref(), &info)? && (env.block.time < config.start_time) {
+        return Err(ContractError::BeforeMintStartTime {});
     }
 
     // Check if already minted max per address limit
-    if let Some(per_address_limit) = config.per_address_limit {
-        let tokens: Cw721TokensResponse = deps.querier.query_wasm_smart(
-            sg721_address.to_string(),
-            &Sg721QueryMsg::Tokens {
-                owner: info.sender.to_string(),
-                start_after: None,
-                limit: Some(MAX_PER_ADDRESS_LIMIT as u32),
-            },
-        )?;
-        if tokens.tokens.len() >= per_address_limit as usize {
-            return Err(ContractError::MaxPerAddressLimitExceeded {});
-        }
+    let mint_count = mint_count(deps.as_ref(), &info)?;
+    if mint_count >= config.per_address_limit {
+        return Err(ContractError::MaxPerAddressLimitExceeded {});
     }
 
     _execute_mint(deps, env, info, action, false, None, None)
+}
+
+// Check if a whitelist exists and not ended
+// Sender has to be whitelisted to mint
+fn is_public_mint(deps: Deps, info: &MessageInfo) -> Result<bool, ContractError> {
+    let config = CONFIG.load(deps.storage)?;
+
+    // If there is no whitelist, there's only a public mint
+    if config.whitelist.is_none() {
+        return Ok(true);
+    }
+
+    let whitelist = config.whitelist.unwrap();
+
+    let wl_config: WhitelistConfigResponse = deps
+        .querier
+        .query_wasm_smart(whitelist.clone(), &WhitelistQueryMsg::Config {})?;
+
+    if !wl_config.is_active {
+        return Ok(true);
+    }
+
+    let res: HasMemberResponse = deps.querier.query_wasm_smart(
+        whitelist,
+        &WhitelistQueryMsg::HasMember {
+            member: info.sender.to_string(),
+        },
+    )?;
+    if !res.has_member {
+        return Err(ContractError::NotWhitelisted {
+            addr: info.sender.to_string(),
+        });
+    }
+
+    // Check wl per address limit
+    let mint_count = mint_count(deps, info)?;
+    if mint_count >= wl_config.per_address_limit {
+        return Err(ContractError::MaxPerAddressLimitExceeded {});
+    }
+
+    Ok(false)
 }
 
 pub fn execute_mint_to(
     deps: DepsMut,
     env: Env,
     info: MessageInfo,
-    recipient: Addr,
+    recipient: String,
 ) -> Result<Response, ContractError> {
+    let recipient = deps.api.addr_validate(&recipient)?;
     let config = CONFIG.load(deps.storage)?;
     let action = "mint_to";
 
@@ -293,9 +297,10 @@ pub fn execute_mint_for(
     deps: DepsMut,
     env: Env,
     info: MessageInfo,
-    token_id: u64,
-    recipient: Addr,
+    token_id: u32,
+    recipient: String,
 ) -> Result<Response, ContractError> {
+    let recipient = deps.api.addr_validate(&recipient)?;
     let config = CONFIG.load(deps.storage)?;
     let action = "mint_for";
 
@@ -317,6 +322,10 @@ pub fn execute_mint_for(
     )
 }
 
+// Generalize checks and mint message creation
+// mint -> _execute_mint(recipient: None, token_id: None)
+// mint_to(recipient: "friend") -> _execute_mint(Some(recipient), token_id: None)
+// mint_for(recipient: "friend2", token_id: 420) -> _execute_mint(recipient, token_id)
 fn _execute_mint(
     deps: DepsMut,
     env: Env,
@@ -324,27 +333,18 @@ fn _execute_mint(
     action: &str,
     admin_no_fee: bool,
     recipient: Option<Addr>,
-    token_id: Option<u64>,
+    token_id: Option<u32>,
 ) -> Result<Response, ContractError> {
-    // generalize checks and mint message creation
-    // mint -> _execute_mint(recipient: None, token_id: None)
-    // mint_to(recipient: "friend") -> _execute_mint(Some(recipient), token_id: None)
-    // mint_for(recipient: "friend2", token_id: 420) -> _execute_mint(recipient, token_id)
-    let mut msgs: Vec<CosmosMsg<StargazeMsgWrapper>> = vec![];
     let config = CONFIG.load(deps.storage)?;
     let sg721_address = SG721_ADDRESS.load(deps.storage)?;
-    let recipient_addr = if recipient.is_none() {
-        info.sender.clone()
-    } else if let Some(some_recipient) = recipient {
-        some_recipient
-    } else {
-        return Err(ContractError::InvalidAddress {
-            addr: info.sender.to_string(),
-        });
+
+    let recipient_addr = match recipient {
+        Some(some_recipient) => some_recipient,
+        None => info.sender.clone(),
     };
 
     let mint_price: Coin = mint_price(deps.as_ref(), admin_no_fee)?;
-    // exact payment only
+    // Exact payment only accepted
     let payment = may_pay(&info, &config.unit_price.denom)?;
     if payment != mint_price.amount {
         return Err(ContractError::IncorrectPaymentAmount(
@@ -353,15 +353,9 @@ fn _execute_mint(
         ));
     }
 
-    // guardrail against low mint price updates
-    if MIN_MINT_PRICE > mint_price.amount.into() && !admin_no_fee {
-        return Err(ContractError::InsufficientMintPrice {
-            expected: MIN_MINT_PRICE,
-            got: mint_price.amount.into(),
-        });
-    }
+    let mut msgs: Vec<CosmosMsg<StargazeMsgWrapper>> = vec![];
 
-    // create network fee msgs
+    // Create network fee msgs
     let network_fee: Uint128 = if admin_no_fee {
         Uint128::zero()
     } else {
@@ -375,30 +369,31 @@ fn _execute_mint(
         network_fee
     };
 
-    // if token_id None, find and assign one. else check token_id exists on mintable map.
-    let mintable_token_id: u64 = if token_id.is_none() {
-        let mintable_tokens_result: StdResult<Vec<u64>> = MINTABLE_TOKEN_IDS
-            .keys(deps.storage, None, None, Order::Ascending)
-            .take(1)
-            .collect();
-        let mintable_tokens = mintable_tokens_result?;
-        if mintable_tokens.is_empty() {
-            return Err(ContractError::SoldOut {});
+    let mintable_token_id = match token_id {
+        Some(token_id) => {
+            if token_id == 0 || token_id > config.num_tokens {
+                return Err(ContractError::InvalidTokenId {});
+            }
+            // If token_id not on mintable map, throw err
+            if !MINTABLE_TOKEN_IDS.has(deps.storage, token_id) {
+                return Err(ContractError::TokenIdAlreadySold { token_id });
+            }
+            token_id
         }
-        mintable_tokens[0]
-    } else if let Some(some_token_id) = token_id {
-        // If token_id not on mintable map, throw err
-        if !MINTABLE_TOKEN_IDS.has(deps.storage, some_token_id) {
-            return Err(ContractError::TokenIdAlreadySold {
-                token_id: some_token_id,
-            });
+        None => {
+            let mintable_tokens_result: StdResult<Vec<u32>> = MINTABLE_TOKEN_IDS
+                .keys(deps.storage, None, None, Order::Ascending)
+                .take(1)
+                .collect();
+            let mintable_tokens = mintable_tokens_result?;
+            if mintable_tokens.is_empty() {
+                return Err(ContractError::SoldOut {});
+            }
+            mintable_tokens[0]
         }
-        some_token_id
-    } else {
-        return Err(ContractError::InvalidTokenId {});
     };
 
-    // create mint msgs
+    // Create mint msgs
     let mint_msg = Cw721ExecuteMsg::Mint(MintMsg::<Empty> {
         token_id: mintable_token_id.to_string(),
         owner: recipient_addr.to_string(),
@@ -412,11 +407,17 @@ fn _execute_mint(
     });
     msgs.append(&mut vec![msg]);
 
-    // remove mintable token id from map
+    // Remove mintable token id from map
     MINTABLE_TOKEN_IDS.remove(deps.storage, mintable_token_id);
+    let mintable_num_tokens = MINTABLE_NUM_TOKENS.load(deps.storage)?;
+    // Decrement mintable num tokens
+    MINTABLE_NUM_TOKENS.save(deps.storage, &(mintable_num_tokens - 1))?;
+    // Save the new mint count for the sender's address
+    let new_mint_count = mint_count(deps.as_ref(), &info)? + 1;
+    MINTER_ADDRS.save(deps.storage, info.clone().sender, &new_mint_count)?;
 
     let mut seller_amount = Uint128::zero();
-    // does have a fee
+    // Does have a fee
     if !admin_no_fee {
         seller_amount = mint_price.amount - network_fee;
         msgs.append(&mut vec![CosmosMsg::Bank(BankMsg::Send {
@@ -433,15 +434,14 @@ fn _execute_mint(
         .add_attribute("network_fee", network_fee)
         .add_attribute("mint_price", mint_price.amount)
         .add_attribute("seller_amount", seller_amount)
-        .add_attribute("no_fee", admin_no_fee.to_string())
         .add_messages(msgs))
 }
 
 pub fn execute_update_start_time(
     deps: DepsMut,
-    _env: Env,
+    env: Env,
     info: MessageInfo,
-    start_time: Expiration,
+    start_time: Timestamp,
 ) -> Result<Response, ContractError> {
     let mut config = CONFIG.load(deps.storage)?;
     if info.sender != config.admin {
@@ -449,15 +449,23 @@ pub fn execute_update_start_time(
             "Sender is not an admin".to_owned(),
         ));
     }
+    // If current time is after the stored start time return error
+    if env.block.time >= config.start_time {
+        return Err(ContractError::AlreadyStarted {});
+    }
 
-    let default_start_time = Expiration::AtTime(Timestamp::from_nanos(GENESIS_MINT_START_TIME));
-    let start_time = if start_time < default_start_time {
-        default_start_time
-    } else {
-        start_time
-    };
+    // If current time already passed the new start_time return error
+    if env.block.time > start_time {
+        return Err(ContractError::InvalidStartTime(start_time, env.block.time));
+    }
 
-    config.start_time = Some(start_time);
+    let genesis_start_time = Timestamp::from_nanos(GENESIS_MINT_START_TIME);
+    // If the new start_time is before genesis start time return error
+    if start_time < genesis_start_time {
+        return Err(ContractError::BeforeGenesisTime {});
+    }
+
+    config.start_time = start_time;
     CONFIG.save(deps.storage, &config)?;
     Ok(Response::new()
         .add_attribute("action", "update_start_time")
@@ -477,13 +485,14 @@ pub fn execute_update_per_address_limit(
             "Sender is not an admin".to_owned(),
         ));
     }
-    if per_address_limit > MAX_PER_ADDRESS_LIMIT {
+    if per_address_limit == 0 || per_address_limit > MAX_PER_ADDRESS_LIMIT {
         return Err(ContractError::InvalidPerAddressLimit {
-            max: MAX_PER_ADDRESS_LIMIT.to_string(),
-            got: per_address_limit.to_string(),
+            max: MAX_PER_ADDRESS_LIMIT,
+            min: 1,
+            got: per_address_limit,
         });
     }
-    config.per_address_limit = Some(per_address_limit);
+    config.per_address_limit = per_address_limit;
     CONFIG.save(deps.storage, &config)?;
     Ok(Response::new()
         .add_attribute("action", "update_per_address_limit")
@@ -491,29 +500,39 @@ pub fn execute_update_per_address_limit(
         .add_attribute("limit", per_address_limit.to_string()))
 }
 
+// if admin_no_fee => no fee,
+// else if in whitelist => whitelist price
+// else => config unit price
 pub fn mint_price(deps: Deps, admin_no_fee: bool) -> Result<Coin, StdError> {
-    // if admin_no_fee => no fee,
-    // else if in whitelist => whitelist price
-    // else => config unit price
     let config = CONFIG.load(deps.storage)?;
-    let mint_price: Coin = if admin_no_fee {
-        Coin {
-            amount: Uint128::zero(),
-            denom: NATIVE_DENOM.to_string(),
-        }
-    } else if let Some(whitelist) = config.whitelist {
-        let wl_config: WhitelistConfigResponse = deps
-            .querier
-            .query_wasm_smart(whitelist, &WhitelistQueryMsg::Config {})?;
-        if wl_config.is_active {
-            wl_config.unit_price
-        } else {
-            config.unit_price.clone()
-        }
+
+    if admin_no_fee {
+        return Ok(coin(0, config.unit_price.denom));
+    }
+
+    if config.whitelist.is_none() {
+        return Ok(config.unit_price);
+    }
+
+    let whitelist = config.whitelist.unwrap();
+
+    let wl_config: WhitelistConfigResponse = deps
+        .querier
+        .query_wasm_smart(whitelist, &WhitelistQueryMsg::Config {})?;
+
+    if wl_config.is_active {
+        Ok(wl_config.unit_price)
     } else {
-        config.unit_price.clone()
-    };
-    Ok(mint_price)
+        Ok(config.unit_price)
+    }
+}
+
+fn mint_count(deps: Deps, info: &MessageInfo) -> Result<u32, StdError> {
+    let mint_count = (MINTER_ADDRS
+        .key(info.sender.clone())
+        .may_load(deps.storage)?)
+    .unwrap_or(0);
+    Ok(mint_count)
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
@@ -523,6 +542,7 @@ pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
         QueryMsg::StartTime {} => to_binary(&query_start_time(deps)?),
         QueryMsg::MintableNumTokens {} => to_binary(&query_mintable_num_tokens(deps)?),
         QueryMsg::MintPrice {} => to_binary(&query_mint_price(deps)?),
+        QueryMsg::MintCount { address } => to_binary(&query_mint_count(deps, address)?),
     }
 }
 
@@ -531,38 +551,37 @@ fn query_config(deps: Deps) -> StdResult<ConfigResponse> {
     let sg721_address = SG721_ADDRESS.load(deps.storage)?;
 
     Ok(ConfigResponse {
-        admin: config.admin,
+        admin: config.admin.to_string(),
         base_token_uri: config.base_token_uri,
-        sg721_address,
+        sg721_address: sg721_address.to_string(),
         sg721_code_id: config.sg721_code_id,
         num_tokens: config.num_tokens,
         start_time: config.start_time,
         unit_price: config.unit_price,
         per_address_limit: config.per_address_limit,
-        whitelist: config.whitelist,
+        whitelist: config.whitelist.map(|w| w.to_string()),
+    })
+}
+
+fn query_mint_count(deps: Deps, address: String) -> StdResult<MintCountResponse> {
+    let addr = deps.api.addr_validate(&address)?;
+    let mint_count = (MINTER_ADDRS.key(addr.clone()).may_load(deps.storage)?).unwrap_or(0);
+    Ok(MintCountResponse {
+        address: addr.to_string(),
+        count: mint_count,
     })
 }
 
 fn query_start_time(deps: Deps) -> StdResult<StartTimeResponse> {
     let config = CONFIG.load(deps.storage)?;
-    if let Some(expiration) = config.start_time {
-        Ok(StartTimeResponse {
-            start_time: expiration.to_string(),
-        })
-    } else {
-        Err(StdError::GenericErr {
-            msg: "start time not found".to_string(),
-        })
-    }
+    Ok(StartTimeResponse {
+        start_time: config.start_time.to_string(),
+    })
 }
 
 fn query_mintable_num_tokens(deps: Deps) -> StdResult<MintableNumTokensResponse> {
-    let count = MINTABLE_TOKEN_IDS
-        .keys(deps.storage, None, None, Order::Ascending)
-        .count();
-    Ok(MintableNumTokensResponse {
-        count: count as u64,
-    })
+    let count = MINTABLE_NUM_TOKENS.load(deps.storage)?;
+    Ok(MintableNumTokensResponse { count })
 }
 
 fn query_mint_price(deps: Deps) -> StdResult<MintPriceResponse> {
@@ -570,10 +589,10 @@ fn query_mint_price(deps: Deps) -> StdResult<MintPriceResponse> {
     let current_price = mint_price(deps, false)?;
     let public_price = config.unit_price;
     let whitelist_price: Option<Coin> = if let Some(whitelist) = config.whitelist {
-        let unit_price: UnitPriceResponse = deps
+        let wl_config: WhitelistConfigResponse = deps
             .querier
-            .query_wasm_smart(whitelist, &WhitelistQueryMsg::UnitPrice {})?;
-        Some(unit_price.unit_price)
+            .query_wasm_smart(whitelist, &WhitelistQueryMsg::Config {})?;
+        Some(wl_config.unit_price)
     } else {
         None
     };

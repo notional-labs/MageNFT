@@ -1,20 +1,20 @@
 use crate::multi::StargazeApp;
 use cosmwasm_std::testing::{mock_dependencies_with_balance, mock_env, mock_info};
-use cosmwasm_std::{coin, coins, Addr, Decimal, Timestamp, Uint128};
+use cosmwasm_std::{coin, coins, Addr, Decimal, Empty, Timestamp, Uint128};
 use cosmwasm_std::{Api, Coin};
 use cw721::{Cw721QueryMsg, OwnerOfResponse};
+use cw721_base::ExecuteMsg as Cw721ExecuteMsg;
 use cw_multi_test::{BankSudo, Contract, ContractWrapper, Executor, SudoMsg};
-use cw_utils::Expiration;
-use sg721::msg::InstantiateMsg as Sg721InstantiateMsg;
-use sg721::state::{Config, RoyaltyInfo};
+use sg721::msg::{InstantiateMsg as Sg721InstantiateMsg, RoyaltyInfoResponse};
+use sg721::state::CollectionInfo;
 use sg_std::{StargazeMsgWrapper, GENESIS_MINT_START_TIME, NATIVE_DENOM};
 use whitelist::msg::InstantiateMsg as WhitelistInstantiateMsg;
-use whitelist::msg::{ExecuteMsg as WhitelistExecuteMsg, UpdateMembersMsg};
+use whitelist::msg::{AddMembersMsg, ExecuteMsg as WhitelistExecuteMsg};
 
 use crate::contract::instantiate;
 use crate::msg::{
-    ConfigResponse, ExecuteMsg, InstantiateMsg, MintPriceResponse, MintableNumTokensResponse,
-    QueryMsg, StartTimeResponse,
+    ConfigResponse, ExecuteMsg, InstantiateMsg, MintCountResponse, MintPriceResponse,
+    MintableNumTokensResponse, QueryMsg, StartTimeResponse,
 };
 use crate::ContractError;
 
@@ -59,20 +59,18 @@ pub fn contract_sg721() -> Box<dyn Contract<StargazeMsgWrapper>> {
     Box::new(contract)
 }
 
-fn setup_whitelist_contract(
-    router: &mut StargazeApp,
-    creator: &Addr,
-) -> Result<Addr, ContractError> {
+fn setup_whitelist_contract(router: &mut StargazeApp, creator: &Addr) -> Addr {
     let whitelist_code_id = router.store_code(contract_whitelist());
 
     let msg = WhitelistInstantiateMsg {
         members: vec![],
-        start_time: Expiration::Never {},
-        end_time: Expiration::Never {},
+        start_time: Timestamp::from_nanos(GENESIS_MINT_START_TIME + 100),
+        end_time: Timestamp::from_nanos(GENESIS_MINT_START_TIME + 10000000),
         unit_price: coin(WHITELIST_AMOUNT, NATIVE_DENOM),
         per_address_limit: WL_PER_ADDRESS_LIMIT,
+        member_limit: 1000,
     };
-    let whitelist_addr = router
+    router
         .instantiate_contract(
             whitelist_code_id,
             creator.clone(),
@@ -81,28 +79,26 @@ fn setup_whitelist_contract(
             "whitelist",
             None,
         )
-        .unwrap();
-
-    Ok(whitelist_addr)
+        .unwrap()
 }
 
-// Upload contract code and instantiate sale contract
+// Upload contract code and instantiate minter contract
 fn setup_minter_contract(
     router: &mut StargazeApp,
     creator: &Addr,
-    num_tokens: u64,
-) -> Result<(Addr, ConfigResponse), ContractError> {
+    num_tokens: u32,
+) -> (Addr, ConfigResponse) {
     // Upload contract code
     let sg721_code_id = router.store_code(contract_sg721());
     let minter_code_id = router.store_code(contract_minter());
     let creation_fee = coins(CREATION_FEE, NATIVE_DENOM);
 
-    // Instantiate sale contract
+    // Instantiate minter contract
     let msg = InstantiateMsg {
         unit_price: coin(UNIT_PRICE, NATIVE_DENOM),
         num_tokens,
-        start_time: None,
-        per_address_limit: None,
+        start_time: Timestamp::from_nanos(GENESIS_MINT_START_TIME),
+        per_address_limit: 5,
         whitelist: None,
         base_token_uri: "ipfs://QmYxw1rURvnbQbBRTfmVaZtxSrkrfsbodNzibgBrVrUrtN".to_string(),
         sg721_code_id,
@@ -110,14 +106,16 @@ fn setup_minter_contract(
             name: String::from("TEST"),
             symbol: String::from("TEST"),
             minter: creator.to_string(),
-            config: Some(Config {
-                contract_uri: Some(String::from("ipfs://url.json")),
-                creator: Some(creator.clone()),
-                royalties: Some(RoyaltyInfo {
-                    payment_address: creator.clone(),
+            collection_info: CollectionInfo {
+                creator: creator.to_string(),
+                description: String::from("Stargaze Monkeys"),
+                image: "https://example.com/image.png".to_string(),
+                external_link: Some("https://example.com/external.html".to_string()),
+                royalty_info: Some(RoyaltyInfoResponse {
+                    payment_address: creator.to_string(),
                     share: Decimal::percent(10),
                 }),
-            }),
+            },
         },
     };
     let minter_addr = router
@@ -136,11 +134,11 @@ fn setup_minter_contract(
         .query_wasm_smart(minter_addr.clone(), &QueryMsg::Config {})
         .unwrap();
 
-    Ok((minter_addr, config))
+    (minter_addr, config)
 }
 
 // Add a creator account with initial balances
-fn setup_accounts(router: &mut StargazeApp) -> Result<(Addr, Addr), ContractError> {
+fn setup_accounts(router: &mut StargazeApp) -> (Addr, Addr) {
     let buyer = Addr::unchecked("buyer");
     let creator = Addr::unchecked("creator");
     // 3,000 tokens
@@ -175,18 +173,17 @@ fn setup_accounts(router: &mut StargazeApp) -> Result<(Addr, Addr), ContractErro
     let buyer_native_balances = router.wrap().query_all_balances(buyer.clone()).unwrap();
     assert_eq!(buyer_native_balances, buyer_funds);
 
-    Ok((creator, buyer))
+    (creator, buyer)
 }
 
-// set blockchain time to after mint by default
-fn setup_block_time(router: &mut StargazeApp, nanos: u64) -> Result<Timestamp, ContractError> {
+// Set blockchain time to after mint by default
+fn setup_block_time(router: &mut StargazeApp, nanos: u64) {
     let mut block = router.block_info();
     block.time = Timestamp::from_nanos(nanos);
-    router.set_block(block.clone());
-    Ok(block.time)
+    router.set_block(block);
 }
 
-// deal with zero and non-zero coin amounts for msgs
+// Deal with zero and non-zero coin amounts for msgs
 fn coins_for_msg(msg_coin: Coin) -> Vec<Coin> {
     if msg_coin.amount > Uint128::zero() {
         vec![msg_coin]
@@ -204,13 +201,41 @@ fn initialization() {
     let res = deps.api.addr_validate(&(*addr));
     assert!(res.is_ok());
 
+    // 0 per address limit returns error
+    let info = mock_info("creator", &coins(INITIAL_BALANCE, NATIVE_DENOM));
+    let msg = InstantiateMsg {
+        unit_price: coin(UNIT_PRICE, NATIVE_DENOM),
+        num_tokens: 100,
+        start_time: Timestamp::from_nanos(GENESIS_MINT_START_TIME),
+        per_address_limit: 0,
+        whitelist: None,
+        base_token_uri: "ipfs://QmYxw1rURvnbQbBRTfmVaZtxSrkrfsbodNzibgBrVrUrtN".to_string(),
+        sg721_code_id: 1,
+        sg721_instantiate_msg: Sg721InstantiateMsg {
+            name: String::from("TEST"),
+            symbol: String::from("TEST"),
+            minter: info.sender.to_string(),
+            collection_info: CollectionInfo {
+                creator: info.sender.to_string(),
+                description: String::from("Stargaze Monkeys"),
+                image: "https://example.com/image.png".to_string(),
+                external_link: Some("https://example.com/external.html".to_string()),
+                royalty_info: Some(RoyaltyInfoResponse {
+                    payment_address: info.sender.to_string(),
+                    share: Decimal::percent(10),
+                }),
+            },
+        },
+    };
+    instantiate(deps.as_mut(), mock_env(), info, msg).unwrap_err();
+
     // Invalid uri returns error
     let info = mock_info("creator", &coins(INITIAL_BALANCE, NATIVE_DENOM));
     let msg = InstantiateMsg {
         unit_price: coin(UNIT_PRICE, NATIVE_DENOM),
         num_tokens: 100,
-        start_time: None,
-        per_address_limit: None,
+        start_time: Timestamp::from_nanos(GENESIS_MINT_START_TIME),
+        per_address_limit: 5,
         whitelist: None,
         base_token_uri: "https://QmYxw1rURvnbQbBRTfmVaZtxSrkrfsbodNzibgBrVrUrtN".to_string(),
         sg721_code_id: 1,
@@ -218,27 +243,28 @@ fn initialization() {
             name: String::from("TEST"),
             symbol: String::from("TEST"),
             minter: info.sender.to_string(),
-            config: Some(Config {
-                contract_uri: Some(String::from("test")),
-                creator: Some(info.sender.clone()),
-                royalties: Some(RoyaltyInfo {
-                    payment_address: info.sender.clone(),
+            collection_info: CollectionInfo {
+                creator: info.sender.to_string(),
+                description: String::from("Stargaze Monkeys"),
+                image: "https://example.com/image.png".to_string(),
+                external_link: Some("https://example.com/external.html".to_string()),
+                royalty_info: Some(RoyaltyInfoResponse {
+                    payment_address: info.sender.to_string(),
                     share: Decimal::percent(10),
                 }),
-            }),
+            },
         },
     };
-    let res = instantiate(deps.as_mut(), mock_env(), info, msg);
-    assert!(res.is_err());
+    instantiate(deps.as_mut(), mock_env(), info, msg).unwrap_err();
 
-    // invalid denom returns error
+    // Invalid denom returns error
     let wrong_denom = "uosmo";
     let info = mock_info("creator", &coins(INITIAL_BALANCE, NATIVE_DENOM));
     let msg = InstantiateMsg {
         unit_price: coin(UNIT_PRICE, wrong_denom),
         num_tokens: 100,
-        start_time: None,
-        per_address_limit: None,
+        start_time: Timestamp::from_nanos(GENESIS_MINT_START_TIME),
+        per_address_limit: 5,
         whitelist: None,
         base_token_uri: "ipfs://QmYxw1rURvnbQbBRTfmVaZtxSrkrfsbodNzibgBrVrUrtN".to_string(),
         sg721_code_id: 1,
@@ -246,26 +272,27 @@ fn initialization() {
             name: String::from("TEST"),
             symbol: String::from("TEST"),
             minter: info.sender.to_string(),
-            config: Some(Config {
-                contract_uri: Some(String::from("test")),
-                creator: Some(info.sender.clone()),
-                royalties: Some(RoyaltyInfo {
-                    payment_address: info.sender.clone(),
+            collection_info: CollectionInfo {
+                creator: info.sender.to_string(),
+                description: String::from("Stargaze Monkeys"),
+                image: "https://example.com/image.png".to_string(),
+                external_link: Some("https://example.com/external.html".to_string()),
+                royalty_info: Some(RoyaltyInfoResponse {
+                    payment_address: info.sender.to_string(),
                     share: Decimal::percent(10),
                 }),
-            }),
+            },
         },
     };
-    let res = instantiate(deps.as_mut(), mock_env(), info, msg);
-    assert!(res.is_err());
+    instantiate(deps.as_mut(), mock_env(), info, msg).unwrap_err();
 
-    // insufficient mint price returns error
+    // Insufficient mint price returns error
     let info = mock_info("creator", &coins(INITIAL_BALANCE, NATIVE_DENOM));
     let msg = InstantiateMsg {
         unit_price: coin(1, NATIVE_DENOM),
         num_tokens: 100,
-        start_time: None,
-        per_address_limit: None,
+        start_time: Timestamp::from_nanos(GENESIS_MINT_START_TIME),
+        per_address_limit: 5,
         whitelist: None,
         base_token_uri: "ipfs://QmYxw1rURvnbQbBRTfmVaZtxSrkrfsbodNzibgBrVrUrtN".to_string(),
         sg721_code_id: 1,
@@ -273,26 +300,27 @@ fn initialization() {
             name: String::from("TEST"),
             symbol: String::from("TEST"),
             minter: info.sender.to_string(),
-            config: Some(Config {
-                contract_uri: Some(String::from("test")),
-                creator: Some(info.sender.clone()),
-                royalties: Some(RoyaltyInfo {
-                    payment_address: info.sender.clone(),
+            collection_info: CollectionInfo {
+                creator: info.sender.to_string(),
+                description: String::from("Stargaze Monkeys"),
+                image: "https://example.com/image.png".to_string(),
+                external_link: Some("https://example.com/external.html".to_string()),
+                royalty_info: Some(RoyaltyInfoResponse {
+                    payment_address: info.sender.to_string(),
                     share: Decimal::percent(10),
                 }),
-            }),
+            },
         },
     };
-    let res = instantiate(deps.as_mut(), mock_env(), info, msg);
-    assert!(res.is_err());
+    instantiate(deps.as_mut(), mock_env(), info, msg).unwrap_err();
 
-    // over max token limit
+    // Over max token limit
     let info = mock_info("creator", &coins(INITIAL_BALANCE, NATIVE_DENOM));
     let msg = InstantiateMsg {
         unit_price: coin(UNIT_PRICE, NATIVE_DENOM),
-        num_tokens: (MAX_TOKEN_LIMIT + 1).into(),
-        start_time: None,
-        per_address_limit: None,
+        num_tokens: (MAX_TOKEN_LIMIT + 1),
+        start_time: Timestamp::from_nanos(GENESIS_MINT_START_TIME),
+        per_address_limit: 5,
         whitelist: None,
         base_token_uri: "ipfs://QmYxw1rURvnbQbBRTfmVaZtxSrkrfsbodNzibgBrVrUrtN".to_string(),
         sg721_code_id: 1,
@@ -300,38 +328,68 @@ fn initialization() {
             name: String::from("TEST"),
             symbol: String::from("TEST"),
             minter: info.sender.to_string(),
-            config: Some(Config {
-                contract_uri: Some(String::from("test")),
-                creator: Some(info.sender.clone()),
-                royalties: Some(RoyaltyInfo {
-                    payment_address: info.sender.clone(),
+            collection_info: CollectionInfo {
+                creator: info.sender.to_string(),
+                description: String::from("Stargaze Monkeys"),
+                image: "https://example.com/image.png".to_string(),
+                external_link: Some("https://example.com/external.html".to_string()),
+                royalty_info: Some(RoyaltyInfoResponse {
+                    payment_address: info.sender.to_string(),
                     share: Decimal::percent(10),
                 }),
-            }),
+            },
         },
     };
-    let res = instantiate(deps.as_mut(), mock_env(), info, msg);
-    assert!(res.is_err());
+    instantiate(deps.as_mut(), mock_env(), info, msg).unwrap_err();
+
+    // Under min token limit
+    let info = mock_info("creator", &coins(INITIAL_BALANCE, NATIVE_DENOM));
+    let msg = InstantiateMsg {
+        unit_price: coin(UNIT_PRICE, NATIVE_DENOM),
+        num_tokens: 0,
+        start_time: Timestamp::from_nanos(GENESIS_MINT_START_TIME),
+        per_address_limit: 5,
+        whitelist: None,
+        base_token_uri: "ipfs://QmYxw1rURvnbQbBRTfmVaZtxSrkrfsbodNzibgBrVrUrtN".to_string(),
+        sg721_code_id: 1,
+        sg721_instantiate_msg: Sg721InstantiateMsg {
+            name: String::from("TEST"),
+            symbol: String::from("TEST"),
+            minter: info.sender.to_string(),
+            collection_info: CollectionInfo {
+                creator: info.sender.to_string(),
+                description: String::from("Stargaze Monkeys"),
+                image: "https://example.com/image.png".to_string(),
+                external_link: Some("https://example.com/external.html".to_string()),
+                royalty_info: Some(RoyaltyInfoResponse {
+                    payment_address: info.sender.to_string(),
+                    share: Decimal::percent(10),
+                }),
+            },
+        },
+    };
+    instantiate(deps.as_mut(), mock_env(), info, msg).unwrap_err();
 }
 
 #[test]
 fn happy_path() {
     let mut router = custom_mock_app();
-    setup_block_time(&mut router, GENESIS_MINT_START_TIME + 1).unwrap();
-    let (creator, buyer) = setup_accounts(&mut router).unwrap();
-    let num_tokens: u64 = 2;
-    let (minter_addr, config) = setup_minter_contract(&mut router, &creator, num_tokens).unwrap();
+    setup_block_time(&mut router, GENESIS_MINT_START_TIME - 1);
+    let (creator, buyer) = setup_accounts(&mut router);
+    let num_tokens = 2;
+    let (minter_addr, config) = setup_minter_contract(&mut router, &creator, num_tokens);
 
-    // default start time genesis mint time
+    // Default start time genesis mint time
     let res: StartTimeResponse = router
         .wrap()
         .query_wasm_smart(minter_addr.clone(), &QueryMsg::StartTime {})
         .unwrap();
     assert_eq!(
         res.start_time,
-        "expiration time: ".to_owned()
-            + &Timestamp::from_nanos(GENESIS_MINT_START_TIME).to_string()
+        Timestamp::from_nanos(GENESIS_MINT_START_TIME).to_string()
     );
+
+    setup_block_time(&mut router, GENESIS_MINT_START_TIME + 1);
 
     // Fail with incorrect tokens
     let mint_msg = ExecuteMsg::Mint {};
@@ -367,6 +425,18 @@ fn happy_path() {
         coins(INITIAL_BALANCE - UNIT_PRICE, NATIVE_DENOM)
     );
 
+    let res: MintCountResponse = router
+        .wrap()
+        .query_wasm_smart(
+            minter_addr.clone(),
+            &QueryMsg::MintCount {
+                address: buyer.to_string(),
+            },
+        )
+        .unwrap();
+    assert_eq!(res.count, 1);
+    assert_eq!(res.address, buyer.to_string());
+
     // Check NFT is transferred
     let query_owner_msg = Cw721QueryMsg::OwnerOf {
         token_id: String::from("1"),
@@ -380,7 +450,7 @@ fn happy_path() {
 
     // Buyer can't call MintTo
     let mint_to_msg = ExecuteMsg::MintTo {
-        recipient: buyer.clone(),
+        recipient: buyer.to_string(),
     };
     let res = router.execute_contract(
         buyer.clone(),
@@ -405,7 +475,20 @@ fn happy_path() {
     );
     assert!(res.is_ok());
 
-    // minter contract should have no balance
+    // Mint count is not increased if admin mints for the user
+    let res: MintCountResponse = router
+        .wrap()
+        .query_wasm_smart(
+            minter_addr.clone(),
+            &QueryMsg::MintCount {
+                address: buyer.to_string(),
+            },
+        )
+        .unwrap();
+    assert_eq!(res.count, 1);
+    assert_eq!(res.address, buyer.to_string());
+
+    // Minter contract should have no balance
     let minter_balance = router
         .wrap()
         .query_all_balances(minter_addr.clone())
@@ -448,47 +531,28 @@ fn happy_path() {
     );
     assert!(res.is_err());
 }
-
 #[test]
-fn whitelist_access_len_add_remove_expiration() {
+fn mint_count_query() {
     let mut router = custom_mock_app();
-    let (creator, buyer) = setup_accounts(&mut router).unwrap();
-    let num_tokens: u64 = 1;
-    let (minter_addr, _config) = setup_minter_contract(&mut router, &creator, num_tokens).unwrap();
-    let whitelist_addr = setup_whitelist_contract(&mut router, &creator).unwrap();
-    const EXPIRATION_TIME: Timestamp = Timestamp::from_nanos(GENESIS_MINT_START_TIME + 10_000_000);
-    // set to genesis mint start time
-    setup_block_time(&mut router, GENESIS_MINT_START_TIME).unwrap();
+    let (creator, buyer) = setup_accounts(&mut router);
+    let num_tokens = 10;
+    let (minter_addr, config) = setup_minter_contract(&mut router, &creator, num_tokens);
+    let sg721_addr = Addr::unchecked(config.sg721_address);
+    let whitelist_addr = setup_whitelist_contract(&mut router, &creator);
+    const EXPIRATION_TIME: Timestamp = Timestamp::from_nanos(GENESIS_MINT_START_TIME + 10_000);
 
-    // update whitelist_expiration fails if not admin
-    let wl_msg = WhitelistExecuteMsg::UpdateEndTime(Expiration::AtTime(EXPIRATION_TIME));
-    let res = router.execute_contract(
-        buyer.clone(),
-        whitelist_addr.clone(),
-        &wl_msg,
-        &coins(UNIT_PRICE, NATIVE_DENOM),
-    );
-    assert!(res.is_err());
+    // Set block to before genesis mint start time
+    setup_block_time(&mut router, GENESIS_MINT_START_TIME - 1000);
 
-    let wl_msg = WhitelistExecuteMsg::UpdateEndTime(Expiration::AtTime(EXPIRATION_TIME));
-    let res = router.execute_contract(
-        creator.clone(),
-        whitelist_addr.clone(),
-        &wl_msg,
-        &coins(UNIT_PRICE, NATIVE_DENOM),
-    );
+    let wl_msg = WhitelistExecuteMsg::UpdateEndTime(EXPIRATION_TIME);
+    let res = router.execute_contract(creator.clone(), whitelist_addr.clone(), &wl_msg, &[]);
     assert!(res.is_ok());
 
-    let wl_msg = WhitelistExecuteMsg::UpdateStartTime(Expiration::AtTime(Timestamp::from_nanos(0)));
-    let res = router.execute_contract(
-        creator.clone(),
-        whitelist_addr.clone(),
-        &wl_msg,
-        &coins(UNIT_PRICE, NATIVE_DENOM),
-    );
+    let wl_msg = WhitelistExecuteMsg::UpdateStartTime(Timestamp::from_nanos(0));
+    let res = router.execute_contract(creator.clone(), whitelist_addr.clone(), &wl_msg, &[]);
     assert!(res.is_ok());
 
-    // set whitelist in minter contract
+    // Set whitelist in minter contract
     let set_whitelist_msg = ExecuteMsg::SetWhitelist {
         whitelist: whitelist_addr.to_string(),
     };
@@ -496,11 +560,260 @@ fn whitelist_access_len_add_remove_expiration() {
         creator.clone(),
         minter_addr.clone(),
         &set_whitelist_msg,
+        &[],
+    );
+    assert!(res.is_ok());
+
+    // Update per address_limit
+    let set_whitelist_msg = ExecuteMsg::UpdatePerAddressLimit {
+        per_address_limit: 3,
+    };
+    let res = router.execute_contract(
+        creator.clone(),
+        minter_addr.clone(),
+        &set_whitelist_msg,
+        &[],
+    );
+    assert!(res.is_ok());
+
+    // Add buyer to whitelist
+    let inner_msg = AddMembersMsg {
+        to_add: vec![buyer.to_string()],
+    };
+    let wasm_msg = WhitelistExecuteMsg::AddMembers(inner_msg);
+    let res = router.execute_contract(creator.clone(), whitelist_addr, &wasm_msg, &[]);
+    assert!(res.is_ok());
+
+    setup_block_time(&mut router, GENESIS_MINT_START_TIME);
+
+    // Mint succeeds
+    let mint_msg = ExecuteMsg::Mint {};
+    let res = router.execute_contract(
+        buyer.clone(),
+        minter_addr.clone(),
+        &mint_msg,
+        &coins(WHITELIST_AMOUNT, NATIVE_DENOM),
+    );
+    assert!(res.is_ok());
+
+    // Query count
+    let res: MintCountResponse = router
+        .wrap()
+        .query_wasm_smart(
+            minter_addr.clone(),
+            &QueryMsg::MintCount {
+                address: buyer.to_string(),
+            },
+        )
+        .unwrap();
+    assert_eq!(res.count, 1);
+    assert_eq!(res.address, buyer.to_string());
+
+    // Mint fails, over whitelist per address limit
+    let mint_msg = ExecuteMsg::Mint {};
+    let err = router
+        .execute_contract(
+            buyer.clone(),
+            minter_addr.clone(),
+            &mint_msg,
+            &coins(WHITELIST_AMOUNT, NATIVE_DENOM),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.source().unwrap().to_string(),
+        ContractError::MaxPerAddressLimitExceeded {}.to_string()
+    );
+
+    // Set time after wl ends
+    setup_block_time(&mut router, GENESIS_MINT_START_TIME + 20_000);
+
+    // Public mint succeeds
+    let mint_msg = ExecuteMsg::Mint {};
+    let res = router.execute_contract(
+        buyer.clone(),
+        minter_addr.clone(),
+        &mint_msg,
         &coins(UNIT_PRICE, NATIVE_DENOM),
     );
     assert!(res.is_ok());
 
-    // mint fails, buyer is not on whitelist
+    // Query count
+    let res: MintCountResponse = router
+        .wrap()
+        .query_wasm_smart(
+            minter_addr.clone(),
+            &QueryMsg::MintCount {
+                address: buyer.to_string(),
+            },
+        )
+        .unwrap();
+    assert_eq!(res.count, 2);
+    assert_eq!(res.address, buyer.to_string());
+
+    // Buyer transfers NFT to creator
+    let transfer_msg: Cw721ExecuteMsg<Empty> = Cw721ExecuteMsg::TransferNft {
+        recipient: creator.to_string(),
+        token_id: "1".to_string(),
+    };
+    let res = router.execute_contract(
+        buyer.clone(),
+        sg721_addr,
+        &transfer_msg,
+        &coins_for_msg(coin(123, NATIVE_DENOM)),
+    );
+    assert!(res.is_ok());
+
+    // Mint succeeds
+    let mint_msg = ExecuteMsg::Mint {};
+    let res = router.execute_contract(
+        buyer.clone(),
+        minter_addr.clone(),
+        &mint_msg,
+        &coins(UNIT_PRICE, NATIVE_DENOM),
+    );
+    assert!(res.is_ok());
+
+    // Query count
+    let res: MintCountResponse = router
+        .wrap()
+        .query_wasm_smart(
+            minter_addr.clone(),
+            &QueryMsg::MintCount {
+                address: buyer.to_string(),
+            },
+        )
+        .unwrap();
+    assert_eq!(res.count, 3);
+    assert_eq!(res.address, buyer.to_string());
+
+    // Mint fails
+    let mint_msg = ExecuteMsg::Mint {};
+    let err = router
+        .execute_contract(
+            buyer.clone(),
+            minter_addr.clone(),
+            &mint_msg,
+            &coins(WHITELIST_AMOUNT, NATIVE_DENOM),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.source().unwrap().to_string(),
+        ContractError::MaxPerAddressLimitExceeded {}.to_string()
+    );
+
+    // Query count
+    let res: MintCountResponse = router
+        .wrap()
+        .query_wasm_smart(
+            minter_addr,
+            &QueryMsg::MintCount {
+                address: buyer.to_string(),
+            },
+        )
+        .unwrap();
+    assert_eq!(res.count, 3);
+    assert_eq!(res.address, buyer.to_string());
+}
+
+#[test]
+fn whitelist_already_started() {
+    let mut router = custom_mock_app();
+    let (creator, _) = setup_accounts(&mut router);
+    let num_tokens = 1;
+    let (minter_addr, _) = setup_minter_contract(&mut router, &creator, num_tokens);
+    let whitelist_addr = setup_whitelist_contract(&mut router, &creator);
+
+    setup_block_time(&mut router, GENESIS_MINT_START_TIME + 101);
+
+    // set whitelist in minter contract
+    let set_whitelist_msg = ExecuteMsg::SetWhitelist {
+        whitelist: whitelist_addr.to_string(),
+    };
+    router
+        .execute_contract(
+            creator.clone(),
+            minter_addr,
+            &set_whitelist_msg,
+            &coins(UNIT_PRICE, NATIVE_DENOM),
+        )
+        .unwrap_err();
+}
+
+#[test]
+fn whitelist_can_update_before_start() {
+    let mut router = custom_mock_app();
+    let (creator, _) = setup_accounts(&mut router);
+    let num_tokens = 1;
+    let (minter_addr, _) = setup_minter_contract(&mut router, &creator, num_tokens);
+    let whitelist_addr = setup_whitelist_contract(&mut router, &creator);
+
+    setup_block_time(&mut router, GENESIS_MINT_START_TIME - 1000);
+
+    // set whitelist in minter contract
+    let set_whitelist_msg = ExecuteMsg::SetWhitelist {
+        whitelist: whitelist_addr.to_string(),
+    };
+    router
+        .execute_contract(
+            creator.clone(),
+            minter_addr.clone(),
+            &set_whitelist_msg,
+            &coins(UNIT_PRICE, NATIVE_DENOM),
+        )
+        .unwrap();
+
+    // can set twice before starting
+    router
+        .execute_contract(
+            creator.clone(),
+            minter_addr,
+            &set_whitelist_msg,
+            &coins(UNIT_PRICE, NATIVE_DENOM),
+        )
+        .unwrap();
+}
+
+#[test]
+fn whitelist_access_len_add_remove_expiration() {
+    let mut router = custom_mock_app();
+    let (creator, buyer) = setup_accounts(&mut router);
+    let num_tokens = 1;
+    let (minter_addr, config) = setup_minter_contract(&mut router, &creator, num_tokens);
+    let sg721_addr = config.sg721_address;
+    let whitelist_addr = setup_whitelist_contract(&mut router, &creator);
+    const AFTER_GENESIS_TIME: Timestamp = Timestamp::from_nanos(GENESIS_MINT_START_TIME + 100);
+
+    // Set to just before genesis mint start time
+    setup_block_time(&mut router, GENESIS_MINT_START_TIME - 10);
+
+    // Update whitelist_expiration fails if not admin
+    let wl_msg = WhitelistExecuteMsg::UpdateEndTime(AFTER_GENESIS_TIME);
+    router
+        .execute_contract(buyer.clone(), whitelist_addr.clone(), &wl_msg, &[])
+        .unwrap_err();
+
+    // Update whitelist_expiration succeeds when from admin
+    let wl_msg = WhitelistExecuteMsg::UpdateEndTime(AFTER_GENESIS_TIME);
+    let res = router.execute_contract(creator.clone(), whitelist_addr.clone(), &wl_msg, &[]);
+    assert!(res.is_ok());
+
+    let wl_msg = WhitelistExecuteMsg::UpdateStartTime(Timestamp::from_nanos(0));
+    let res = router.execute_contract(creator.clone(), whitelist_addr.clone(), &wl_msg, &[]);
+    assert!(res.is_ok());
+
+    // Set whitelist in minter contract
+    let set_whitelist_msg = ExecuteMsg::SetWhitelist {
+        whitelist: whitelist_addr.to_string(),
+    };
+    let res = router.execute_contract(
+        creator.clone(),
+        minter_addr.clone(),
+        &set_whitelist_msg,
+        &[],
+    );
+    assert!(res.is_ok());
+
+    // Mint fails, buyer is not on whitelist
     let mint_msg = ExecuteMsg::Mint {};
     let res = router.execute_contract(
         buyer.clone(),
@@ -510,20 +823,15 @@ fn whitelist_access_len_add_remove_expiration() {
     );
     assert!(res.is_err());
 
-    let inner_msg = UpdateMembersMsg {
-        add: vec![buyer.to_string()],
-        remove: vec![],
+    // Add buyer to whitelist
+    let inner_msg = AddMembersMsg {
+        to_add: vec![buyer.to_string()],
     };
-    let wasm_msg = WhitelistExecuteMsg::UpdateMembers(inner_msg);
-    let res = router.execute_contract(
-        creator.clone(),
-        whitelist_addr.clone(),
-        &wasm_msg,
-        &coins(UNIT_PRICE, NATIVE_DENOM),
-    );
+    let wasm_msg = WhitelistExecuteMsg::AddMembers(inner_msg);
+    let res = router.execute_contract(creator.clone(), whitelist_addr.clone(), &wasm_msg, &[]);
     assert!(res.is_ok());
 
-    // mint fails, not whitelist price
+    // Mint fails, not whitelist price
     let mint_msg = ExecuteMsg::Mint {};
     router
         .execute_contract(
@@ -534,7 +842,9 @@ fn whitelist_access_len_add_remove_expiration() {
         )
         .unwrap_err();
 
-    // query mint price
+    setup_block_time(&mut router, GENESIS_MINT_START_TIME);
+
+    // Query mint price
     let mint_price_response: MintPriceResponse = router
         .wrap()
         .query_wasm_smart(minter_addr.clone(), &QueryMsg::MintPrice {})
@@ -552,7 +862,7 @@ fn whitelist_access_len_add_remove_expiration() {
         mint_price_response.public_price
     );
 
-    // mint succeeds
+    // Mint succeeds with whitelist price
     let mint_msg = ExecuteMsg::Mint {};
     let res = router.execute_contract(
         buyer.clone(),
@@ -562,7 +872,7 @@ fn whitelist_access_len_add_remove_expiration() {
     );
     assert!(res.is_ok());
 
-    // mint fails, over whitelist per address limit
+    // Mint fails, over whitelist per address limit
     let mint_msg = ExecuteMsg::Mint {};
     let err = router
         .execute_contract(
@@ -577,21 +887,41 @@ fn whitelist_access_len_add_remove_expiration() {
         ContractError::MaxPerAddressLimitExceeded {}.to_string()
     );
 
-    // remove buyer from whitelist
-    let inner_msg = UpdateMembersMsg {
-        add: vec![],
-        remove: vec![buyer.to_string()],
+    // Muyer is generous and transfers to creator
+    let transfer_msg: Cw721ExecuteMsg<Empty> = Cw721ExecuteMsg::TransferNft {
+        recipient: creator.to_string(),
+        token_id: "1".to_string(),
     };
-    let wasm_msg = WhitelistExecuteMsg::UpdateMembers(inner_msg);
     let res = router.execute_contract(
-        creator.clone(),
-        whitelist_addr,
-        &wasm_msg,
-        &coins(UNIT_PRICE, NATIVE_DENOM),
+        buyer.clone(),
+        Addr::unchecked(sg721_addr),
+        &transfer_msg,
+        &coins_for_msg(coin(123, NATIVE_DENOM)),
     );
     assert!(res.is_ok());
 
-    // mint fails
+    // Mint fails, buyer exceeded per address limit
+    let mint_msg = ExecuteMsg::Mint {};
+    let err = router
+        .execute_contract(
+            buyer.clone(),
+            minter_addr.clone(),
+            &mint_msg,
+            &coins(WHITELIST_AMOUNT, NATIVE_DENOM),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.source().unwrap().to_string(),
+        ContractError::MaxPerAddressLimitExceeded {}.to_string()
+    );
+
+    // Remove buyer from whitelist
+    let inner_msg = AddMembersMsg { to_add: vec![] };
+    let wasm_msg = WhitelistExecuteMsg::AddMembers(inner_msg);
+    let res = router.execute_contract(creator.clone(), whitelist_addr, &wasm_msg, &[]);
+    assert!(res.is_ok());
+
+    // Mint fails
     let mint_msg = ExecuteMsg::Mint {};
     let res = router.execute_contract(
         buyer,
@@ -605,14 +935,15 @@ fn whitelist_access_len_add_remove_expiration() {
 #[test]
 fn before_start_time() {
     let mut router = custom_mock_app();
-    let (creator, buyer) = setup_accounts(&mut router).unwrap();
-    let num_tokens: u64 = 1;
-    let (minter_addr, _) = setup_minter_contract(&mut router, &creator, num_tokens).unwrap();
-    // set to before genesis mint start time
-    setup_block_time(&mut router, GENESIS_MINT_START_TIME - 10).unwrap();
+    let (creator, buyer) = setup_accounts(&mut router);
+    let num_tokens = 1;
+    let (minter_addr, _) = setup_minter_contract(&mut router, &creator, num_tokens);
 
-    // set start_time fails if not admin
-    let start_time_msg = ExecuteMsg::UpdateStartTime(Expiration::Never {});
+    // Set to before genesis mint start time
+    setup_block_time(&mut router, GENESIS_MINT_START_TIME - 10);
+
+    // Set start_time fails if not admin
+    let start_time_msg = ExecuteMsg::UpdateStartTime(Timestamp::from_nanos(0));
     let res = router.execute_contract(
         buyer.clone(),
         minter_addr.clone(),
@@ -621,18 +952,7 @@ fn before_start_time() {
     );
     assert!(res.is_err());
 
-    // if block before start_time, throw error
-    let start_time_msg = ExecuteMsg::UpdateStartTime(Expiration::AtTime(Timestamp::from_nanos(
-        GENESIS_MINT_START_TIME,
-    )));
-    let res = router.execute_contract(
-        creator.clone(),
-        minter_addr.clone(),
-        &start_time_msg,
-        &coins(UNIT_PRICE, NATIVE_DENOM),
-    );
-    assert!(res.is_ok());
-
+    // Buyer can't mint before start_time
     let mint_msg = ExecuteMsg::Mint {};
     let res = router.execute_contract(
         buyer.clone(),
@@ -642,21 +962,20 @@ fn before_start_time() {
     );
     assert!(res.is_err());
 
-    // query start_time, confirm expired
+    // Query start_time, confirm expired
     let start_time_response: StartTimeResponse = router
         .wrap()
         .query_wasm_smart(minter_addr.clone(), &QueryMsg::StartTime {})
         .unwrap();
     assert_eq!(
-        "expiration time: ".to_owned()
-            + &Timestamp::from_nanos(GENESIS_MINT_START_TIME).to_string(),
+        Timestamp::from_nanos(GENESIS_MINT_START_TIME).to_string(),
         start_time_response.start_time
     );
 
-    // set block forward, after start time. mint succeeds
-    setup_block_time(&mut router, GENESIS_MINT_START_TIME + 10_000_000).unwrap();
+    // Set block forward, after start time. mint succeeds
+    setup_block_time(&mut router, GENESIS_MINT_START_TIME + 10_000_000);
 
-    // mint succeeds
+    // Mint succeeds
     let mint_msg = ExecuteMsg::Mint {};
     let res = router.execute_contract(
         buyer,
@@ -670,13 +989,14 @@ fn before_start_time() {
 #[test]
 fn check_per_address_limit() {
     let mut router = custom_mock_app();
-    let (creator, buyer) = setup_accounts(&mut router).unwrap();
+    let (creator, buyer) = setup_accounts(&mut router);
     let num_tokens = 2;
-    let (minter_addr, _config) = setup_minter_contract(&mut router, &creator, num_tokens).unwrap();
-    // set to genesis mint start time
-    setup_block_time(&mut router, GENESIS_MINT_START_TIME).unwrap();
+    let (minter_addr, _config) = setup_minter_contract(&mut router, &creator, num_tokens);
 
-    // set limit, check unauthorized
+    // Set to genesis mint start time
+    setup_block_time(&mut router, GENESIS_MINT_START_TIME);
+
+    // Set limit, check unauthorized
     let per_address_limit_msg = ExecuteMsg::UpdatePerAddressLimit {
         per_address_limit: 30,
     };
@@ -688,7 +1008,19 @@ fn check_per_address_limit() {
     );
     assert!(res.is_err());
 
-    // set limit, invalid limit over max
+    // Set limit errors, invalid limit == 0
+    let per_address_limit_msg = ExecuteMsg::UpdatePerAddressLimit {
+        per_address_limit: 0,
+    };
+    let res = router.execute_contract(
+        creator.clone(),
+        minter_addr.clone(),
+        &per_address_limit_msg,
+        &coins(UNIT_PRICE, NATIVE_DENOM),
+    );
+    assert!(res.is_err());
+
+    // Set limit errors, invalid limit over max
     let per_address_limit_msg = ExecuteMsg::UpdatePerAddressLimit {
         per_address_limit: 100,
     };
@@ -700,7 +1032,7 @@ fn check_per_address_limit() {
     );
     assert!(res.is_err());
 
-    // set limit, mint fails, over max
+    // Set limit succeeds, mint fails, over max
     let per_address_limit_msg = ExecuteMsg::UpdatePerAddressLimit {
         per_address_limit: 1,
     };
@@ -712,7 +1044,7 @@ fn check_per_address_limit() {
     );
     assert!(res.is_ok());
 
-    // first mint succeeds
+    // First mint succeeds
     let mint_msg = ExecuteMsg::Mint {};
     let res = router.execute_contract(
         buyer.clone(),
@@ -723,7 +1055,7 @@ fn check_per_address_limit() {
 
     assert!(res.is_ok());
 
-    // second mint fails from exceeding per address limit
+    // Second mint fails from exceeding per address limit
     let mint_msg = ExecuteMsg::Mint {};
     let res = router.execute_contract(
         buyer,
@@ -737,16 +1069,17 @@ fn check_per_address_limit() {
 #[test]
 fn mint_for_token_id_addr() {
     let mut router = custom_mock_app();
-    let (creator, buyer) = setup_accounts(&mut router).unwrap();
-    let num_tokens: u64 = 4;
-    let (minter_addr, _config) = setup_minter_contract(&mut router, &creator, num_tokens).unwrap();
-    // set to genesis mint start time
-    setup_block_time(&mut router, GENESIS_MINT_START_TIME).unwrap();
+    let (creator, buyer) = setup_accounts(&mut router);
+    let num_tokens = 4;
+    let (minter_addr, _config) = setup_minter_contract(&mut router, &creator, num_tokens);
 
-    // try mint_for, test unauthorized
+    // Set to genesis mint start time
+    setup_block_time(&mut router, GENESIS_MINT_START_TIME);
+
+    // Try mint_for, test unauthorized
     let mint_for_msg = ExecuteMsg::MintFor {
         token_id: 1,
-        recipient: buyer.clone(),
+        recipient: buyer.to_string(),
     };
     let err = router
         .execute_contract(
@@ -764,9 +1097,9 @@ fn mint_for_token_id_addr() {
         ContractError::Unauthorized("Sender is not an admin".to_string()).to_string(),
     );
 
-    // test token id already sold
-    // 1. mint token_id 0
-    // 2. mint_for token_id 0
+    // Test token id already sold
+    // 1. mint token_id 1
+    // 2. mint_for token_id 1
     let mint_msg = ExecuteMsg::Mint {};
     let res = router.execute_contract(
         buyer.clone(),
@@ -776,17 +1109,40 @@ fn mint_for_token_id_addr() {
     );
     assert!(res.is_ok());
 
-    // minter contract should have no balance
+    // Minter contract should have no balance
     let minter_balance = router
         .wrap()
         .query_all_balances(minter_addr.clone())
         .unwrap();
     assert_eq!(0, minter_balance.len());
 
+    // Mint fails, invalid token_id
     let token_id = 0;
     let mint_for_msg = ExecuteMsg::MintFor {
         token_id,
-        recipient: buyer.clone(),
+        recipient: buyer.to_string(),
+    };
+    let err = router
+        .execute_contract(
+            creator.clone(),
+            minter_addr.clone(),
+            &mint_for_msg,
+            &coins_for_msg(Coin {
+                amount: Uint128::from(ADMIN_MINT_PRICE),
+                denom: NATIVE_DENOM.to_string(),
+            }),
+        )
+        .unwrap_err();
+    assert_eq!(
+        ContractError::InvalidTokenId {}.to_string(),
+        err.source().unwrap().to_string()
+    );
+
+    // Mint fails, token_id already sold
+    let token_id = 1;
+    let mint_for_msg = ExecuteMsg::MintFor {
+        token_id,
+        recipient: buyer.to_string(),
     };
     let err = router
         .execute_contract(
@@ -803,17 +1159,18 @@ fn mint_for_token_id_addr() {
         ContractError::TokenIdAlreadySold { token_id }.to_string(),
         err.source().unwrap().to_string()
     );
+
     let mintable_num_tokens_response: MintableNumTokensResponse = router
         .wrap()
         .query_wasm_smart(minter_addr.clone(), &QueryMsg::MintableNumTokens {})
         .unwrap();
     assert_eq!(mintable_num_tokens_response.count, 3);
 
-    // test mint_for token_id 2 then normal mint
+    // Test mint_for token_id 2 then normal mint
     let token_id = 2;
     let mint_for_msg = ExecuteMsg::MintFor {
         token_id,
-        recipient: buyer,
+        recipient: buyer.to_string(),
     };
     let res = router.execute_contract(
         creator.clone(),
@@ -836,7 +1193,7 @@ fn mint_for_token_id_addr() {
 #[test]
 fn test_start_time_before_genesis() {
     let mut router = custom_mock_app();
-    let (creator, _) = setup_accounts(&mut router).unwrap();
+    let (creator, _) = setup_accounts(&mut router);
     let num_tokens = 10;
 
     // Upload contract code
@@ -848,10 +1205,8 @@ fn test_start_time_before_genesis() {
     let msg = InstantiateMsg {
         unit_price: coin(UNIT_PRICE, NATIVE_DENOM),
         num_tokens,
-        start_time: Some(Expiration::AtTime(Timestamp::from_nanos(
-            GENESIS_MINT_START_TIME - 100,
-        ))),
-        per_address_limit: None,
+        start_time: Timestamp::from_nanos(GENESIS_MINT_START_TIME),
+        per_address_limit: 5,
         whitelist: None,
         base_token_uri: "ipfs://QmYxw1rURvnbQbBRTfmVaZtxSrkrfsbodNzibgBrVrUrtN".to_string(),
         sg721_code_id,
@@ -859,14 +1214,16 @@ fn test_start_time_before_genesis() {
             name: String::from("TEST"),
             symbol: String::from("TEST"),
             minter: creator.to_string(),
-            config: Some(Config {
-                contract_uri: Some(String::from("ipfs://url.json")),
-                creator: Some(creator.clone()),
-                royalties: Some(RoyaltyInfo {
-                    payment_address: creator.clone(),
+            collection_info: CollectionInfo {
+                creator: creator.to_string(),
+                description: String::from("Stargaze Monkeys"),
+                image: "https://example.com/image.png".to_string(),
+                external_link: Some("https://example.com/external.html".to_string()),
+                royalty_info: Some(RoyaltyInfoResponse {
+                    payment_address: creator.to_string(),
                     share: Decimal::percent(10),
                 }),
-            }),
+            },
         },
     };
     let minter_addr = router
@@ -879,17 +1236,179 @@ fn test_start_time_before_genesis() {
         .unwrap();
     assert_eq!(
         res.start_time,
-        "expiration time: ".to_owned()
-            + &Timestamp::from_nanos(GENESIS_MINT_START_TIME).to_string()
+        Timestamp::from_nanos(GENESIS_MINT_START_TIME).to_string()
     );
+}
+
+#[test]
+fn test_update_start_time() {
+    let mut router = custom_mock_app();
+    let (creator, _) = setup_accounts(&mut router);
+    let num_tokens = 10;
+
+    // Upload contract code
+    let sg721_code_id = router.store_code(contract_sg721());
+    let minter_code_id = router.store_code(contract_minter());
+    let creation_fee = coins(CREATION_FEE, NATIVE_DENOM);
+
+    // Instantiate sale contract
+    let msg = InstantiateMsg {
+        unit_price: coin(UNIT_PRICE, NATIVE_DENOM),
+        num_tokens,
+        start_time: Timestamp::from_nanos(GENESIS_MINT_START_TIME),
+        per_address_limit: 5,
+        whitelist: None,
+        base_token_uri: "ipfs://QmYxw1rURvnbQbBRTfmVaZtxSrkrfsbodNzibgBrVrUrtN".to_string(),
+        sg721_code_id,
+        sg721_instantiate_msg: Sg721InstantiateMsg {
+            name: String::from("TEST"),
+            symbol: String::from("TEST"),
+            minter: creator.to_string(),
+            collection_info: CollectionInfo {
+                creator: creator.to_string(),
+                description: String::from("Stargaze Monkeys"),
+                image: "https://example.com/image.png".to_string(),
+                external_link: Some("https://example.com/external.html".to_string()),
+                royalty_info: None,
+            },
+        },
+    };
+    let minter_addr = router
+        .instantiate_contract(
+            minter_code_id,
+            creator.clone(),
+            &msg,
+            &creation_fee,
+            "Minter",
+            None,
+        )
+        .unwrap();
+
+    // Public mint has started
+    setup_block_time(&mut router, GENESIS_MINT_START_TIME + 100);
+
+    // Update to a start time in the past
+    let msg = ExecuteMsg::UpdateStartTime(Timestamp::from_nanos(GENESIS_MINT_START_TIME - 1000));
+    let err = router
+        .execute_contract(creator, minter_addr, &msg, &[])
+        .unwrap_err();
+    assert_eq!(
+        err.source().unwrap().to_string(),
+        ContractError::AlreadyStarted {}.to_string(),
+    );
+}
+
+#[test]
+fn test_invalid_start_time() {
+    let mut router = custom_mock_app();
+    let (creator, _) = setup_accounts(&mut router);
+    let num_tokens = 10;
+
+    // Upload contract code
+    let sg721_code_id = router.store_code(contract_sg721());
+    let minter_code_id = router.store_code(contract_minter());
+    let creation_fee = coins(CREATION_FEE, NATIVE_DENOM);
+
+    // Instantiate sale contract before genesis mint
+    let mut msg = InstantiateMsg {
+        unit_price: coin(UNIT_PRICE, NATIVE_DENOM),
+        num_tokens,
+        start_time: Timestamp::from_nanos(GENESIS_MINT_START_TIME - 100),
+        per_address_limit: 5,
+        whitelist: None,
+        base_token_uri: "ipfs://QmYxw1rURvnbQbBRTfmVaZtxSrkrfsbodNzibgBrVrUrtN".to_string(),
+        sg721_code_id,
+        sg721_instantiate_msg: Sg721InstantiateMsg {
+            name: String::from("TEST"),
+            symbol: String::from("TEST"),
+            minter: creator.to_string(),
+            collection_info: CollectionInfo {
+                creator: creator.to_string(),
+                description: String::from("Stargaze Monkeys"),
+                image: "https://example.com/image.png".to_string(),
+                external_link: Some("https://example.com/external.html".to_string()),
+                royalty_info: None,
+            },
+        },
+    };
+    // set time before the start_time above
+    setup_block_time(&mut router, GENESIS_MINT_START_TIME - 1000);
+
+    let err = router
+        .instantiate_contract(
+            minter_code_id,
+            creator.clone(),
+            &msg,
+            &creation_fee,
+            "Minter",
+            None,
+        )
+        .unwrap_err();
+    assert_eq!(err.source().unwrap().to_string(), "BeforeGenesisTime");
+
+    // move date after genesis mint
+    setup_block_time(&mut router, GENESIS_MINT_START_TIME + 1000);
+
+    // move start time after genesis but before current time
+    msg.start_time = Timestamp::from_nanos(GENESIS_MINT_START_TIME + 500);
+
+    router
+        .instantiate_contract(
+            minter_code_id,
+            creator.clone(),
+            &msg,
+            &creation_fee,
+            "Minter",
+            None,
+        )
+        .unwrap_err();
+
+    // position block time before the start time
+    setup_block_time(&mut router, GENESIS_MINT_START_TIME + 400);
+
+    let minter_addr = router
+        .instantiate_contract(
+            minter_code_id,
+            creator.clone(),
+            &msg,
+            &creation_fee,
+            "Minter",
+            None,
+        )
+        .unwrap();
+
+    // Update to a start time in the past
+    let msg = ExecuteMsg::UpdateStartTime(Timestamp::from_nanos(GENESIS_MINT_START_TIME - 100));
+    let res = router.execute_contract(creator.clone(), minter_addr.clone(), &msg, &[]);
+    assert!(res.is_err());
+
+    // Update to a time after genesis but before the current block_time (GENESIS+400)
+    let msg = ExecuteMsg::UpdateStartTime(Timestamp::from_nanos(GENESIS_MINT_START_TIME + 300));
+    let res = router.execute_contract(creator.clone(), minter_addr.clone(), &msg, &[]);
+    assert!(res.is_err());
+
+    // Update to a time after genesis and after current blocktime (GENESIS+400)
+    let msg = ExecuteMsg::UpdateStartTime(Timestamp::from_nanos(GENESIS_MINT_START_TIME + 450));
+    let res = router.execute_contract(creator.clone(), minter_addr.clone(), &msg, &[]);
+    assert!(res.is_ok());
+
+    // position block after start time (GENESIS+450);
+    setup_block_time(&mut router, GENESIS_MINT_START_TIME + 500);
+
+    // Update to a time after genesis and after current blocktime (GENESIS+400)
+    let msg = ExecuteMsg::UpdateStartTime(Timestamp::from_nanos(GENESIS_MINT_START_TIME + 450));
+    let err = router
+        .execute_contract(creator, minter_addr, &msg, &[])
+        .unwrap_err();
+    assert_eq!(err.source().unwrap().to_string(), "AlreadyStarted");
 }
 
 #[test]
 fn unhappy_path() {
     let mut router = custom_mock_app();
-    let (creator, buyer) = setup_accounts(&mut router).unwrap();
-    let num_tokens: u64 = 1;
-    let (minter_addr, _config) = setup_minter_contract(&mut router, &creator, num_tokens).unwrap();
+    let (creator, buyer) = setup_accounts(&mut router);
+    let num_tokens = 1;
+    let (minter_addr, _config) = setup_minter_contract(&mut router, &creator, num_tokens);
 
     // Fails if too little funds are sent
     let mint_msg = ExecuteMsg::Mint {};
