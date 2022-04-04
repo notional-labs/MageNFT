@@ -1,26 +1,38 @@
 use cosmwasm_std::StdError;
 use thiserror::Error;
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, PartialEq)]
 pub enum ContractError {
     #[error("{0}")]
     Std(#[from] StdError),
 
-    #[error("Name is not in the expected format (3-30 UTF-8 bytes)")]
-    NameWrongFormat {},
+    #[error("Unauthorized")]
+    Unauthorized {},
 
-    #[error("Ticker symbol is not in expected format [A-Z]{{3,6}}")]
-    TickerWrongSymbolFormat {},
+    #[error("Cannot set to own account")]
+    CannotSetOwnAccount {},
 
-    #[error("Decimals must not exceed 18")]
-    DecimalsExceeded {},
+    #[error("Invalid zero amount")]
+    InvalidZeroAmount {},
 
-    #[error("Insufficient allowance (allowance {allowance}, required={required})")]
-    InsufficientAllowance { allowance: u128, required: u128 },
+    #[error("Allowance is expired")]
+    Expired {},
 
-    #[error("Insufficient funds (balance {balance}, required={required})")]
-    InsufficientFunds { balance: u128, required: u128 },
+    #[error("No allowance for this account")]
+    NoAllowance {},
 
-    #[error("Corrupted data found (16 byte expected)")]
-    CorruptedDataFound {},
+    #[error("Minting cannot exceed the cap")]
+    CannotExceedCap {},
+
+    #[error("Logo binary data exceeds 5KB limit")]
+    LogoTooBig {},
+
+    #[error("Invalid xml preamble for SVG")]
+    InvalidXmlPreamble {},
+
+    #[error("Invalid png header")]
+    InvalidPngHeader {},
+
+    #[error("Duplicate initial balance addresses")]
+    DuplicateInitialBalanceAddresses {},
 }

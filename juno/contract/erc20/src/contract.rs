@@ -1,63 +1,185 @@
+#[cfg(not(feature = "library"))]
+use cosmwasm_std::entry_point;
 use cosmwasm_std::{
-    entry_point, to_binary, to_vec, Addr, Binary, Deps, DepsMut, Env, MessageInfo, Response,
-    StdResult, Storage, Uint128,
+    to_binary, Binary, Deps, DepsMut, Env, MessageInfo, Response, StdError, StdResult, Uint128,
 };
-use cosmwasm_storage::{PrefixedStorage, ReadonlyPrefixedStorage};
-use std::convert::TryInto;
 
+use cw2::set_contract_version;
+use cw20::{
+    BalanceResponse, Cw20Coin, Cw20ReceiveMsg, DownloadLogoResponse, EmbeddedLogo, Logo, LogoInfo,
+    MarketingInfoResponse, MinterResponse, TokenInfoResponse,
+};
+
+use crate::allowances::{
+    execute_burn_from, execute_decrease_allowance, execute_increase_allowance, execute_send_from,
+    execute_transfer_from, query_allowance,
+};
+use crate::enumerable::{query_all_accounts, query_all_allowances};
 use crate::error::ContractError;
-use crate::msg::{AllowanceResponse, BalanceResponse, ExecuteMsg, InstantiateMsg, QueryMsg};
-use crate::state::Constants;
+use crate::msg::{ExecuteMsg, InstantiateMsg, QueryMsg};
+use crate::state::{MinterData, TokenInfo, BALANCES, LOGO, MARKETING_INFO, TOKEN_INFO};
 
-pub const PREFIX_CONFIG: &[u8] = b"config";
-pub const PREFIX_BALANCES: &[u8] = b"balances";
-pub const PREFIX_ALLOWANCES: &[u8] = b"allowances";
+// version info for migration info
+const CONTRACT_NAME: &str = "crates.io:cw20-base";
+const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub const KEY_CONSTANTS: &[u8] = b"constants";
-pub const KEY_TOTAL_SUPPLY: &[u8] = b"total_supply";
+const LOGO_SIZE_CAP: usize = 5 * 1024;
 
-#[entry_point]
+/// Checks if data starts with XML preamble
+fn verify_xml_preamble(data: &[u8]) -> Result<(), ContractError> {
+    // The easiest way to perform this check would be just match on regex, however regex
+    // compilation is heavy and probably not worth it.
+
+    let preamble = data
+        .split_inclusive(|c| *c == b'>')
+        .next()
+        .ok_or(ContractError::InvalidXmlPreamble {})?;
+
+    const PREFIX: &[u8] = b"<?xml ";
+    const POSTFIX: &[u8] = b"?>";
+
+    if !(preamble.starts_with(PREFIX) && preamble.ends_with(POSTFIX)) {
+        Err(ContractError::InvalidXmlPreamble {})
+    } else {
+        Ok(())
+    }
+
+    // Additionally attributes format could be validated as they are well defined, as well as
+    // comments presence inside of preable, but it is probably not worth it.
+}
+
+/// Validates XML logo
+fn verify_xml_logo(logo: &[u8]) -> Result<(), ContractError> {
+    verify_xml_preamble(logo)?;
+
+    if logo.len() > LOGO_SIZE_CAP {
+        Err(ContractError::LogoTooBig {})
+    } else {
+        Ok(())
+    }
+}
+
+/// Validates png logo
+fn verify_png_logo(logo: &[u8]) -> Result<(), ContractError> {
+    // PNG header format:
+    // 0x89 - magic byte, out of ASCII table to fail on 7-bit systems
+    // "PNG" ascii representation
+    // [0x0d, 0x0a] - dos style line ending
+    // 0x1a - dos control character, stop displaying rest of the file
+    // 0x0a - unix style line ending
+    const HEADER: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    if logo.len() > LOGO_SIZE_CAP {
+        Err(ContractError::LogoTooBig {})
+    } else if !logo.starts_with(&HEADER) {
+        Err(ContractError::InvalidPngHeader {})
+    } else {
+        Ok(())
+    }
+}
+
+/// Checks if passed logo is correct, and if not, returns an error
+fn verify_logo(logo: &Logo) -> Result<(), ContractError> {
+    match logo {
+        Logo::Embedded(EmbeddedLogo::Svg(logo)) => verify_xml_logo(logo),
+        Logo::Embedded(EmbeddedLogo::Png(logo)) => verify_png_logo(logo),
+        Logo::Url(_) => Ok(()), // Any reasonable url validation would be regex based, probably not worth it
+    }
+}
+
+#[cfg_attr(not(feature = "library"), entry_point)]
 pub fn instantiate(
-    deps: DepsMut,
+    mut deps: DepsMut,
     _env: Env,
     _info: MessageInfo,
     msg: InstantiateMsg,
 ) -> Result<Response, ContractError> {
-    let mut total_supply: u128 = 0;
-    {
-        // Initial balances
-        let mut balances_store = PrefixedStorage::new(deps.storage, PREFIX_BALANCES);
-        for row in msg.initial_balances {
-            let amount_raw = row.amount.u128();
-            balances_store.set(row.address.as_str().as_bytes(), &amount_raw.to_be_bytes());
-            total_supply += amount_raw;
+    set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
+    // check valid token info
+    msg.validate()?;
+    // create initial accounts
+    let total_supply = create_accounts(&mut deps, &msg.initial_balances)?;
+
+    if let Some(limit) = msg.get_cap() {
+        if total_supply > limit {
+            return Err(StdError::generic_err("Initial supply greater than cap").into());
         }
     }
 
-    // Check name, symbol, decimals
-    if !is_valid_name(&msg.name) {
-        return Err(ContractError::NameWrongFormat {});
-    }
-    if !is_valid_symbol(&msg.symbol) {
-        return Err(ContractError::TickerWrongSymbolFormat {});
-    }
-    if msg.decimals > 18 {
-        return Err(ContractError::DecimalsExceeded {});
-    }
+    let mint = match msg.mint {
+        Some(m) => Some(MinterData {
+            minter: deps.api.addr_validate(&m.minter)?,
+            cap: m.cap,
+        }),
+        None => None,
+    };
 
-    let mut config_store = PrefixedStorage::new(deps.storage, PREFIX_CONFIG);
-    let constants = to_vec(&Constants {
+    // store token info
+    let data = TokenInfo {
         name: msg.name,
         symbol: msg.symbol,
         decimals: msg.decimals,
-    })?;
-    config_store.set(KEY_CONSTANTS, &constants);
-    config_store.set(KEY_TOTAL_SUPPLY, &total_supply.to_be_bytes());
+        total_supply,
+        mint,
+    };
+    TOKEN_INFO.save(deps.storage, &data)?;
+
+    if let Some(marketing) = msg.marketing {
+        let logo = if let Some(logo) = marketing.logo {
+            verify_logo(&logo)?;
+            LOGO.save(deps.storage, &logo)?;
+
+            match logo {
+                Logo::Url(url) => Some(LogoInfo::Url(url)),
+                Logo::Embedded(_) => Some(LogoInfo::Embedded),
+            }
+        } else {
+            None
+        };
+
+        let data = MarketingInfoResponse {
+            project: marketing.project,
+            description: marketing.description,
+            marketing: marketing
+                .marketing
+                .map(|addr| deps.api.addr_validate(&addr))
+                .transpose()?,
+            logo,
+        };
+        MARKETING_INFO.save(deps.storage, &data)?;
+    }
 
     Ok(Response::default())
 }
 
-#[entry_point]
+pub fn create_accounts(
+    deps: &mut DepsMut,
+    accounts: &[Cw20Coin],
+) -> Result<Uint128, ContractError> {
+    validate_accounts(accounts)?;
+
+    let mut total_supply = Uint128::zero();
+    for row in accounts {
+        let address = deps.api.addr_validate(&row.address)?;
+        BALANCES.save(deps.storage, &address, &row.amount)?;
+        total_supply += row.amount;
+    }
+
+    Ok(total_supply)
+}
+
+pub fn validate_accounts(accounts: &[Cw20Coin]) -> Result<(), ContractError> {
+    let mut addresses = accounts.iter().map(|c| &c.address).collect::<Vec<_>>();
+    addresses.sort();
+    addresses.dedup();
+
+    if addresses.len() != accounts.len() {
+        Err(ContractError::DuplicateInitialBalanceAddresses {})
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg_attr(not(feature = "library"), entry_point)]
 pub fn execute(
     deps: DepsMut,
     env: Env,
@@ -65,1412 +187,1778 @@ pub fn execute(
     msg: ExecuteMsg,
 ) -> Result<Response, ContractError> {
     match msg {
-        ExecuteMsg::Approve { spender, amount } => try_approve(deps, env, info, spender, &amount),
         ExecuteMsg::Transfer { recipient, amount } => {
-            try_transfer(deps, env, info, recipient, &amount)
+            execute_transfer(deps, env, info, recipient, amount)
         }
+        ExecuteMsg::Burn { amount } => execute_burn(deps, env, info, amount),
+        ExecuteMsg::Send {
+            contract,
+            amount,
+            msg,
+        } => execute_send(deps, env, info, contract, amount, msg),
+        ExecuteMsg::Mint { recipient, amount } => execute_mint(deps, env, info, recipient, amount),
+        ExecuteMsg::IncreaseAllowance {
+            spender,
+            amount,
+            expires,
+        } => execute_increase_allowance(deps, env, info, spender, amount, expires),
+        ExecuteMsg::DecreaseAllowance {
+            spender,
+            amount,
+            expires,
+        } => execute_decrease_allowance(deps, env, info, spender, amount, expires),
         ExecuteMsg::TransferFrom {
             owner,
             recipient,
             amount,
-        } => try_transfer_from(deps, env, info, owner, recipient, &amount),
-        ExecuteMsg::Burn { amount } => try_burn(deps, env, info, &amount),
+        } => execute_transfer_from(deps, env, info, owner, recipient, amount),
+        ExecuteMsg::BurnFrom { owner, amount } => execute_burn_from(deps, env, info, owner, amount),
+        ExecuteMsg::SendFrom {
+            owner,
+            contract,
+            amount,
+            msg,
+        } => execute_send_from(deps, env, info, owner, contract, amount, msg),
+        ExecuteMsg::UpdateMarketing {
+            project,
+            description,
+            marketing,
+        } => execute_update_marketing(deps, env, info, project, description, marketing),
+        ExecuteMsg::UploadLogo(logo) => execute_upload_logo(deps, env, info, logo),
     }
 }
 
-#[entry_point]
-pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> Result<Binary, ContractError> {
-    match msg {
-        QueryMsg::Balance { address } => {
-            let address_key = deps.api.addr_validate(&address)?;
-            let balance = read_balance(deps.storage, &address_key)?;
-            let out = to_binary(&BalanceResponse {
-                balance: Uint128::from(balance),
-            })?;
-            Ok(out)
-        }
-        QueryMsg::Allowance { owner, spender } => {
-            let owner_key = deps.api.addr_validate(&owner)?;
-            let spender_key = deps.api.addr_validate(&spender)?;
-            let allowance = read_allowance(deps.storage, &owner_key, &spender_key)?;
-            let out = to_binary(&AllowanceResponse {
-                allowance: Uint128::from(allowance),
-            })?;
-            Ok(out)
-        }
-    }
-}
-
-fn try_transfer(
+pub fn execute_transfer(
     deps: DepsMut,
     _env: Env,
     info: MessageInfo,
     recipient: String,
-    amount: &Uint128,
+    amount: Uint128,
 ) -> Result<Response, ContractError> {
-    perform_transfer(
+    if amount == Uint128::zero() {
+        return Err(ContractError::InvalidZeroAmount {});
+    }
+
+    let rcpt_addr = deps.api.addr_validate(&recipient)?;
+
+    BALANCES.update(
         deps.storage,
         &info.sender,
-        &deps.api.addr_validate(recipient.as_str())?,
-        amount.u128(),
+        |balance: Option<Uint128>| -> StdResult<_> {
+            Ok(balance.unwrap_or_default().checked_sub(amount)?)
+        },
     )?;
-    Ok(Response::new()
+    BALANCES.update(
+        deps.storage,
+        &rcpt_addr,
+        |balance: Option<Uint128>| -> StdResult<_> { Ok(balance.unwrap_or_default() + amount) },
+    )?;
+
+    let res = Response::new()
         .add_attribute("action", "transfer")
-        .add_attribute("sender", info.sender)
-        .add_attribute("recipient", recipient))
+        .add_attribute("from", info.sender)
+        .add_attribute("to", recipient)
+        .add_attribute("amount", amount);
+    Ok(res)
 }
 
-fn try_transfer_from(
+pub fn execute_burn(
     deps: DepsMut,
     _env: Env,
     info: MessageInfo,
-    owner: String,
-    recipient: String,
-    amount: &Uint128,
+    amount: Uint128,
 ) -> Result<Response, ContractError> {
-    let owner_address = deps.api.addr_validate(owner.as_str())?;
-    let recipient_address = deps.api.addr_validate(recipient.as_str())?;
-    let amount_raw = amount.u128();
-
-    let mut allowance = read_allowance(deps.storage, &owner_address, &info.sender)?;
-    if allowance < amount_raw {
-        return Err(ContractError::InsufficientAllowance {
-            allowance,
-            required: amount_raw,
-        });
+    if amount == Uint128::zero() {
+        return Err(ContractError::InvalidZeroAmount {});
     }
-    allowance -= amount_raw;
-    write_allowance(deps.storage, &owner_address, &info.sender, allowance)?;
-    perform_transfer(deps.storage, &owner_address, &recipient_address, amount_raw)?;
 
-    Ok(Response::new()
-        .add_attribute("action", "transfer_from")
-        .add_attribute("spender", &info.sender)
-        .add_attribute("sender", owner)
-        .add_attribute("recipient", recipient))
-}
+    // lower balance
+    BALANCES.update(
+        deps.storage,
+        &info.sender,
+        |balance: Option<Uint128>| -> StdResult<_> {
+            Ok(balance.unwrap_or_default().checked_sub(amount)?)
+        },
+    )?;
+    // reduce total_supply
+    TOKEN_INFO.update(deps.storage, |mut info| -> StdResult<_> {
+        info.total_supply = info.total_supply.checked_sub(amount)?;
+        Ok(info)
+    })?;
 
-fn try_approve(
-    deps: DepsMut,
-    _env: Env,
-    info: MessageInfo,
-    spender: String,
-    amount: &Uint128,
-) -> Result<Response, ContractError> {
-    let spender_address = deps.api.addr_validate(spender.as_str())?;
-    write_allowance(deps.storage, &info.sender, &spender_address, amount.u128())?;
-    Ok(Response::new()
-        .add_attribute("action", "approve")
-        .add_attribute("owner", info.sender)
-        .add_attribute("spender", spender))
-}
-
-/// Burn tokens
-///
-/// Remove `amount` tokens from the system irreversibly, from signer account
-///
-/// @param amount the amount of money to burn
-fn try_burn(
-    deps: DepsMut,
-    _env: Env,
-    info: MessageInfo,
-    amount: &Uint128,
-) -> Result<Response, ContractError> {
-    let amount_raw = amount.u128();
-
-    let mut account_balance = read_balance(deps.storage, &info.sender)?;
-
-    if account_balance < amount_raw {
-        return Err(ContractError::InsufficientFunds {
-            balance: account_balance,
-            required: amount_raw,
-        });
-    }
-    account_balance -= amount_raw;
-
-    let mut balances_store = PrefixedStorage::new(deps.storage, PREFIX_BALANCES);
-    balances_store.set(
-        info.sender.as_str().as_bytes(),
-        &account_balance.to_be_bytes(),
-    );
-
-    let mut config_store = PrefixedStorage::new(deps.storage, PREFIX_CONFIG);
-    let data = config_store
-        .get(KEY_TOTAL_SUPPLY)
-        .expect("no total supply data stored");
-    let mut total_supply = bytes_to_u128(&data).unwrap();
-
-    total_supply -= amount_raw;
-
-    config_store.set(KEY_TOTAL_SUPPLY, &total_supply.to_be_bytes());
-
-    Ok(Response::new()
+    let res = Response::new()
         .add_attribute("action", "burn")
-        .add_attribute("account", info.sender)
-        .add_attribute("amount", amount.to_string()))
+        .add_attribute("from", info.sender)
+        .add_attribute("amount", amount);
+    Ok(res)
 }
 
-fn perform_transfer(
-    store: &mut dyn Storage,
-    from: &Addr,
-    to: &Addr,
-    amount: u128,
-) -> Result<(), ContractError> {
-    let mut balances_store = PrefixedStorage::new(store, PREFIX_BALANCES);
-
-    let mut from_balance = match balances_store.get(from.as_str().as_bytes()) {
-        Some(data) => bytes_to_u128(&data),
-        None => Ok(0u128),
-    }?;
-
-    if from_balance < amount {
-        return Err(ContractError::InsufficientFunds {
-            balance: from_balance,
-            required: amount,
-        });
+pub fn execute_mint(
+    deps: DepsMut,
+    _env: Env,
+    info: MessageInfo,
+    recipient: String,
+    amount: Uint128,
+) -> Result<Response, ContractError> {
+    if amount == Uint128::zero() {
+        return Err(ContractError::InvalidZeroAmount {});
     }
-    from_balance -= amount;
-    balances_store.set(from.as_str().as_bytes(), &from_balance.to_be_bytes());
 
-    let mut to_balance = match balances_store.get(to.as_str().as_bytes()) {
-        Some(data) => bytes_to_u128(&data),
-        None => Ok(0u128),
-    }?;
-    to_balance += amount;
-    balances_store.set(to.as_str().as_bytes(), &to_balance.to_be_bytes());
-
-    Ok(())
-}
-
-// Converts 16 bytes value into u128
-// Errors if data found that is not 16 bytes
-pub fn bytes_to_u128(data: &[u8]) -> Result<u128, ContractError> {
-    match data[0..16].try_into() {
-        Ok(bytes) => Ok(u128::from_be_bytes(bytes)),
-        Err(_) => Err(ContractError::CorruptedDataFound {}),
+    let mut config = TOKEN_INFO.load(deps.storage)?;
+    if config.mint.is_none() || config.mint.as_ref().unwrap().minter != info.sender {
+        return Err(ContractError::Unauthorized {});
     }
-}
 
-// Reads 16 byte storage value into u128
-// Returns zero if key does not exist. Errors if data found that is not 16 bytes
-pub fn read_u128(store: &ReadonlyPrefixedStorage, key: &Addr) -> Result<u128, ContractError> {
-    let result = store.get(key.as_str().as_bytes());
-    match result {
-        Some(data) => bytes_to_u128(&data),
-        None => Ok(0u128),
-    }
-}
-
-fn read_balance(store: &dyn Storage, owner: &Addr) -> Result<u128, ContractError> {
-    let balance_store = ReadonlyPrefixedStorage::new(store, PREFIX_BALANCES);
-    read_u128(&balance_store, owner)
-}
-
-fn read_allowance(
-    store: &dyn Storage,
-    owner: &Addr,
-    spender: &Addr,
-) -> Result<u128, ContractError> {
-    let owner_store =
-        ReadonlyPrefixedStorage::multilevel(store, &[PREFIX_ALLOWANCES, owner.as_str().as_bytes()]);
-    read_u128(&owner_store, spender)
-}
-
-#[allow(clippy::unnecessary_wraps)]
-fn write_allowance(
-    store: &mut dyn Storage,
-    owner: &Addr,
-    spender: &Addr,
-    amount: u128,
-) -> StdResult<()> {
-    let mut owner_store =
-        PrefixedStorage::multilevel(store, &[PREFIX_ALLOWANCES, owner.as_str().as_bytes()]);
-    owner_store.set(spender.as_str().as_bytes(), &amount.to_be_bytes());
-    Ok(())
-}
-
-fn is_valid_name(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    if bytes.len() < 3 || bytes.len() > 30 {
-        return false;
-    }
-    true
-}
-
-fn is_valid_symbol(symbol: &str) -> bool {
-    let bytes = symbol.as_bytes();
-    if bytes.len() < 3 || bytes.len() > 6 {
-        return false;
-    }
-    for byte in bytes.iter() {
-        if *byte < 65 || *byte > 90 {
-            return false;
+    // update supply and enforce cap
+    config.total_supply += amount;
+    if let Some(limit) = config.get_cap() {
+        if config.total_supply > limit {
+            return Err(ContractError::CannotExceedCap {});
         }
     }
-    true
+    TOKEN_INFO.save(deps.storage, &config)?;
+
+    // add amount to recipient balance
+    let rcpt_addr = deps.api.addr_validate(&recipient)?;
+    BALANCES.update(
+        deps.storage,
+        &rcpt_addr,
+        |balance: Option<Uint128>| -> StdResult<_> { Ok(balance.unwrap_or_default() + amount) },
+    )?;
+
+    let res = Response::new()
+        .add_attribute("action", "mint")
+        .add_attribute("to", recipient)
+        .add_attribute("amount", amount);
+    Ok(res)
+}
+
+pub fn execute_send(
+    deps: DepsMut,
+    _env: Env,
+    info: MessageInfo,
+    contract: String,
+    amount: Uint128,
+    msg: Binary,
+) -> Result<Response, ContractError> {
+    if amount == Uint128::zero() {
+        return Err(ContractError::InvalidZeroAmount {});
+    }
+
+    let rcpt_addr = deps.api.addr_validate(&contract)?;
+
+    // move the tokens to the contract
+    BALANCES.update(
+        deps.storage,
+        &info.sender,
+        |balance: Option<Uint128>| -> StdResult<_> {
+            Ok(balance.unwrap_or_default().checked_sub(amount)?)
+        },
+    )?;
+    BALANCES.update(
+        deps.storage,
+        &rcpt_addr,
+        |balance: Option<Uint128>| -> StdResult<_> { Ok(balance.unwrap_or_default() + amount) },
+    )?;
+
+    let res = Response::new()
+        .add_attribute("action", "send")
+        .add_attribute("from", &info.sender)
+        .add_attribute("to", &contract)
+        .add_attribute("amount", amount)
+        .add_message(
+            Cw20ReceiveMsg {
+                sender: info.sender.into(),
+                amount,
+                msg,
+            }
+            .into_cosmos_msg(contract)?,
+        );
+    Ok(res)
+}
+
+pub fn execute_update_marketing(
+    deps: DepsMut,
+    _env: Env,
+    info: MessageInfo,
+    project: Option<String>,
+    description: Option<String>,
+    marketing: Option<String>,
+) -> Result<Response, ContractError> {
+    let mut marketing_info = MARKETING_INFO
+        .may_load(deps.storage)?
+        .ok_or(ContractError::Unauthorized {})?;
+
+    if marketing_info
+        .marketing
+        .as_ref()
+        .ok_or(ContractError::Unauthorized {})?
+        != &info.sender
+    {
+        return Err(ContractError::Unauthorized {});
+    }
+
+    match project {
+        Some(empty) if empty.trim().is_empty() => marketing_info.project = None,
+        Some(project) => marketing_info.project = Some(project),
+        None => (),
+    }
+
+    match description {
+        Some(empty) if empty.trim().is_empty() => marketing_info.description = None,
+        Some(description) => marketing_info.description = Some(description),
+        None => (),
+    }
+
+    match marketing {
+        Some(empty) if empty.trim().is_empty() => marketing_info.marketing = None,
+        Some(marketing) => marketing_info.marketing = Some(deps.api.addr_validate(&marketing)?),
+        None => (),
+    }
+
+    if marketing_info.project.is_none()
+        && marketing_info.description.is_none()
+        && marketing_info.marketing.is_none()
+        && marketing_info.logo.is_none()
+    {
+        MARKETING_INFO.remove(deps.storage);
+    } else {
+        MARKETING_INFO.save(deps.storage, &marketing_info)?;
+    }
+
+    let res = Response::new().add_attribute("action", "update_marketing");
+    Ok(res)
+}
+
+pub fn execute_upload_logo(
+    deps: DepsMut,
+    _env: Env,
+    info: MessageInfo,
+    logo: Logo,
+) -> Result<Response, ContractError> {
+    let mut marketing_info = MARKETING_INFO
+        .may_load(deps.storage)?
+        .ok_or(ContractError::Unauthorized {})?;
+
+    verify_logo(&logo)?;
+
+    if marketing_info
+        .marketing
+        .as_ref()
+        .ok_or(ContractError::Unauthorized {})?
+        != &info.sender
+    {
+        return Err(ContractError::Unauthorized {});
+    }
+
+    LOGO.save(deps.storage, &logo)?;
+
+    let logo_info = match logo {
+        Logo::Url(url) => LogoInfo::Url(url),
+        Logo::Embedded(_) => LogoInfo::Embedded,
+    };
+
+    marketing_info.logo = Some(logo_info);
+    MARKETING_INFO.save(deps.storage, &marketing_info)?;
+
+    let res = Response::new().add_attribute("action", "upload_logo");
+    Ok(res)
+}
+
+#[cfg_attr(not(feature = "library"), entry_point)]
+pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
+    match msg {
+        QueryMsg::Balance { address } => to_binary(&query_balance(deps, address)?),
+        QueryMsg::TokenInfo {} => to_binary(&query_token_info(deps)?),
+        QueryMsg::Minter {} => to_binary(&query_minter(deps)?),
+        QueryMsg::Allowance { owner, spender } => {
+            to_binary(&query_allowance(deps, owner, spender)?)
+        }
+        QueryMsg::AllAllowances {
+            owner,
+            start_after,
+            limit,
+        } => to_binary(&query_all_allowances(deps, owner, start_after, limit)?),
+        QueryMsg::AllAccounts { start_after, limit } => {
+            to_binary(&query_all_accounts(deps, start_after, limit)?)
+        }
+        QueryMsg::MarketingInfo {} => to_binary(&query_marketing_info(deps)?),
+        QueryMsg::DownloadLogo {} => to_binary(&query_download_logo(deps)?),
+    }
+}
+
+pub fn query_balance(deps: Deps, address: String) -> StdResult<BalanceResponse> {
+    let address = deps.api.addr_validate(&address)?;
+    let balance = BALANCES
+        .may_load(deps.storage, &address)?
+        .unwrap_or_default();
+    Ok(BalanceResponse { balance })
+}
+
+pub fn query_token_info(deps: Deps) -> StdResult<TokenInfoResponse> {
+    let info = TOKEN_INFO.load(deps.storage)?;
+    let res = TokenInfoResponse {
+        name: info.name,
+        symbol: info.symbol,
+        decimals: info.decimals,
+        total_supply: info.total_supply,
+    };
+    Ok(res)
+}
+
+pub fn query_minter(deps: Deps) -> StdResult<Option<MinterResponse>> {
+    let meta = TOKEN_INFO.load(deps.storage)?;
+    let minter = match meta.mint {
+        Some(m) => Some(MinterResponse {
+            minter: m.minter.into(),
+            cap: m.cap,
+        }),
+        None => None,
+    };
+    Ok(minter)
+}
+
+pub fn query_marketing_info(deps: Deps) -> StdResult<MarketingInfoResponse> {
+    Ok(MARKETING_INFO.may_load(deps.storage)?.unwrap_or_default())
+}
+
+pub fn query_download_logo(deps: Deps) -> StdResult<DownloadLogoResponse> {
+    let logo = LOGO.load(deps.storage)?;
+    match logo {
+        Logo::Embedded(EmbeddedLogo::Svg(logo)) => Ok(DownloadLogoResponse {
+            mime_type: "image/svg+xml".to_owned(),
+            data: logo,
+        }),
+        Logo::Embedded(EmbeddedLogo::Png(logo)) => Ok(DownloadLogoResponse {
+            mime_type: "image/png".to_owned(),
+            data: logo,
+        }),
+        Logo::Url(_) => Err(StdError::not_found("logo")),
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use cosmwasm_std::testing::{
+        mock_dependencies, mock_dependencies_with_balance, mock_env, mock_info,
+    };
+    use cosmwasm_std::{coins, from_binary, Addr, CosmosMsg, StdError, SubMsg, WasmMsg};
+
     use super::*;
-    use crate::msg::InitialBalance;
-    use cosmwasm_std::testing::{mock_dependencies, mock_env, mock_info};
-    use cosmwasm_std::{from_slice, Addr, Env, MessageInfo, Storage, Timestamp, Uint128};
-    use cosmwasm_storage::ReadonlyPrefixedStorage;
+    use crate::msg::InstantiateMarketingInfo;
 
-    fn mock_env_height(signer: &str, height: u64, time: u64) -> (Env, MessageInfo) {
-        let mut env = mock_env();
-        let info = mock_info(signer, &[]);
-        env.block.height = height;
-        env.block.time = Timestamp::from_seconds(time);
-        (env, info)
+    fn get_balance<T: Into<String>>(deps: Deps, address: T) -> Uint128 {
+        query_balance(deps, address.into()).unwrap().balance
     }
 
-    fn get_constants(storage: &dyn Storage) -> Constants {
-        let config_storage = ReadonlyPrefixedStorage::new(storage, PREFIX_CONFIG);
-        let data = config_storage
-            .get(KEY_CONSTANTS)
-            .expect("no config data stored");
-        from_slice(&data).expect("invalid data")
+    // this will set up the instantiation for other tests
+    fn do_instantiate_with_minter(
+        deps: DepsMut,
+        addr: &str,
+        amount: Uint128,
+        minter: &str,
+        cap: Option<Uint128>,
+    ) -> TokenInfoResponse {
+        _do_instantiate(
+            deps,
+            addr,
+            amount,
+            Some(MinterResponse {
+                minter: minter.to_string(),
+                cap,
+            }),
+        )
     }
 
-    fn get_total_supply(storage: &dyn Storage) -> u128 {
-        let config_storage = ReadonlyPrefixedStorage::new(storage, PREFIX_CONFIG);
-        let data = config_storage
-            .get(KEY_TOTAL_SUPPLY)
-            .expect("no decimals data stored");
-        return bytes_to_u128(&data).unwrap();
+    // this will set up the instantiation for other tests
+    fn do_instantiate(deps: DepsMut, addr: &str, amount: Uint128) -> TokenInfoResponse {
+        _do_instantiate(deps, addr, amount, None)
     }
 
-    fn get_balance(storage: &dyn Storage, address: &Addr) -> u128 {
-        let balances_storage = ReadonlyPrefixedStorage::new(storage, PREFIX_BALANCES);
-        return read_u128(&balances_storage, address).unwrap();
-    }
+    // this will set up the instantiation for other tests
+    fn _do_instantiate(
+        mut deps: DepsMut,
+        addr: &str,
+        amount: Uint128,
+        mint: Option<MinterResponse>,
+    ) -> TokenInfoResponse {
+        let instantiate_msg = InstantiateMsg {
+            name: "Auto Gen".to_string(),
+            symbol: "AUTO".to_string(),
+            decimals: 3,
+            initial_balances: vec![Cw20Coin {
+                address: addr.to_string(),
+                amount,
+            }],
+            mint: mint.clone(),
+            marketing: None,
+        };
+        let info = mock_info("creator", &[]);
+        let env = mock_env();
+        let res = instantiate(deps.branch(), env, info, instantiate_msg).unwrap();
+        assert_eq!(0, res.messages.len());
 
-    fn get_allowance(storage: &dyn Storage, owner: &Addr, spender: &Addr) -> u128 {
-        let owner_storage = ReadonlyPrefixedStorage::multilevel(
-            storage,
-            &[PREFIX_ALLOWANCES, owner.as_str().as_bytes()],
+        let meta = query_token_info(deps.as_ref()).unwrap();
+        assert_eq!(
+            meta,
+            TokenInfoResponse {
+                name: "Auto Gen".to_string(),
+                symbol: "AUTO".to_string(),
+                decimals: 3,
+                total_supply: amount,
+            }
         );
-        return read_u128(&owner_storage, spender).unwrap();
+        assert_eq!(get_balance(deps.as_ref(), addr), amount);
+        assert_eq!(query_minter(deps.as_ref()).unwrap(), mint,);
+        meta
     }
+
+    const PNG_HEADER: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 
     mod instantiate {
         use super::*;
-        use crate::error::ContractError;
 
         #[test]
-        fn works() {
-            let mut deps = mock_dependencies(&[]);
+        fn basic() {
+            let mut deps = mock_dependencies();
+            let amount = Uint128::from(11223344u128);
             let instantiate_msg = InstantiateMsg {
                 name: "Cash Token".to_string(),
                 symbol: "CASH".to_string(),
                 decimals: 9,
-                initial_balances: [InitialBalance {
-                    address: "addr0000".to_string(),
-                    amount: Uint128::from(11223344u128),
-                }]
-                .to_vec(),
+                initial_balances: vec![Cw20Coin {
+                    address: String::from("addr0000"),
+                    amount,
+                }],
+                mint: None,
+                marketing: None,
             };
-            let (env, info) = mock_env_height("creator", 450, 550);
+            let info = mock_info("creator", &[]);
+            let env = mock_env();
             let res = instantiate(deps.as_mut(), env, info, instantiate_msg).unwrap();
             assert_eq!(0, res.messages.len());
+
             assert_eq!(
-                get_constants(&deps.storage),
-                Constants {
+                query_token_info(deps.as_ref()).unwrap(),
+                TokenInfoResponse {
                     name: "Cash Token".to_string(),
                     symbol: "CASH".to_string(),
-                    decimals: 9
+                    decimals: 9,
+                    total_supply: amount,
                 }
             );
             assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr0000".to_string())),
-                11223344
+                get_balance(deps.as_ref(), "addr0000"),
+                Uint128::new(11223344)
             );
-            assert_eq!(get_total_supply(&deps.storage), 11223344);
         }
 
         #[test]
-        fn works_with_empty_balance() {
-            let mut deps = mock_dependencies(&[]);
+        fn mintable() {
+            let mut deps = mock_dependencies();
+            let amount = Uint128::new(11223344);
+            let minter = String::from("asmodat");
+            let limit = Uint128::new(511223344);
             let instantiate_msg = InstantiateMsg {
                 name: "Cash Token".to_string(),
                 symbol: "CASH".to_string(),
                 decimals: 9,
-                initial_balances: [].to_vec(),
+                initial_balances: vec![Cw20Coin {
+                    address: "addr0000".into(),
+                    amount,
+                }],
+                mint: Some(MinterResponse {
+                    minter: minter.clone(),
+                    cap: Some(limit),
+                }),
+                marketing: None,
             };
-            let (env, info) = mock_env_height("creator", 450, 550);
+            let info = mock_info("creator", &[]);
+            let env = mock_env();
             let res = instantiate(deps.as_mut(), env, info, instantiate_msg).unwrap();
             assert_eq!(0, res.messages.len());
-            assert_eq!(get_total_supply(&deps.storage), 0);
+
+            assert_eq!(
+                query_token_info(deps.as_ref()).unwrap(),
+                TokenInfoResponse {
+                    name: "Cash Token".to_string(),
+                    symbol: "CASH".to_string(),
+                    decimals: 9,
+                    total_supply: amount,
+                }
+            );
+            assert_eq!(
+                get_balance(deps.as_ref(), "addr0000"),
+                Uint128::new(11223344)
+            );
+            assert_eq!(
+                query_minter(deps.as_ref()).unwrap(),
+                Some(MinterResponse {
+                    minter,
+                    cap: Some(limit),
+                }),
+            );
         }
 
         #[test]
-        fn works_with_multiple_balances() {
-            let mut deps = mock_dependencies(&[]);
+        fn mintable_over_cap() {
+            let mut deps = mock_dependencies();
+            let amount = Uint128::new(11223344);
+            let minter = String::from("asmodat");
+            let limit = Uint128::new(11223300);
             let instantiate_msg = InstantiateMsg {
                 name: "Cash Token".to_string(),
                 symbol: "CASH".to_string(),
                 decimals: 9,
-                initial_balances: [
-                    InitialBalance {
-                        address: "addr0000".to_string(),
-                        amount: Uint128::from(11u128),
-                    },
-                    InitialBalance {
-                        address: "addr1111".to_string(),
-                        amount: Uint128::from(22u128),
-                    },
-                    InitialBalance {
-                        address: "addrbbbb".to_string(),
-                        amount: Uint128::from(33u128),
-                    },
-                ]
-                .to_vec(),
+                initial_balances: vec![Cw20Coin {
+                    address: String::from("addr0000"),
+                    amount,
+                }],
+                mint: Some(MinterResponse {
+                    minter,
+                    cap: Some(limit),
+                }),
+                marketing: None,
             };
-            let (env, info) = mock_env_height("creator", 450, 550);
-            let res = instantiate(deps.as_mut(), env, info, instantiate_msg).unwrap();
-            assert_eq!(0, res.messages.len());
+            let info = mock_info("creator", &[]);
+            let env = mock_env();
+            let err = instantiate(deps.as_mut(), env, info, instantiate_msg).unwrap_err();
             assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr0000".to_string())),
-                11
+                err,
+                StdError::generic_err("Initial supply greater than cap").into()
             );
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr1111".to_string())),
-                22
-            );
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addrbbbb".to_string())),
-                33
-            );
-            assert_eq!(get_total_supply(&deps.storage), 66);
         }
 
-        #[test]
-        fn works_with_balance_larger_than_53_bit() {
-            let mut deps = mock_dependencies(&[]);
-            // This value cannot be represented precisely in JavaScript and jq. Both
-            //   node -e "console.attr(9007199254740993)"
-            //   echo '{ "value": 9007199254740993 }' | jq
-            // return 9007199254740992
-            let instantiate_msg = InstantiateMsg {
-                name: "Cash Token".to_string(),
-                symbol: "CASH".to_string(),
-                decimals: 9,
-                initial_balances: [InitialBalance {
-                    address: "addr0000".to_string(),
-                    amount: Uint128::from(9007199254740993u128),
-                }]
-                .to_vec(),
-            };
-            let (env, info) = mock_env_height("creator", 450, 550);
-            let res = instantiate(deps.as_mut(), env, info, instantiate_msg).unwrap();
-            assert_eq!(0, res.messages.len());
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr0000".to_string())),
-                9007199254740993
-            );
-            assert_eq!(get_total_supply(&deps.storage), 9007199254740993);
-        }
+        mod marketing {
+            use super::*;
 
-        #[test]
-        // Typical supply like 100 million tokens with 18 decimals exceeds the 64 bit range
-        fn works_with_balance_larger_than_64_bit() {
-            let mut deps = mock_dependencies(&[]);
-            let instantiate_msg = InstantiateMsg {
-                name: "Cash Token".to_string(),
-                symbol: "CASH".to_string(),
-                decimals: 9,
-                initial_balances: [InitialBalance {
-                    address: "addr0000".to_string(),
-                    amount: Uint128::from(100000000000000000000000000u128),
-                }]
-                .to_vec(),
-            };
-            let (env, info) = mock_env_height("creator", 450, 550);
-            let res = instantiate(deps.as_mut(), env, info, instantiate_msg).unwrap();
-            assert_eq!(0, res.messages.len());
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr0000".to_string())),
-                100000000000000000000000000
-            );
-            assert_eq!(get_total_supply(&deps.storage), 100000000000000000000000000);
-        }
+            #[test]
+            fn basic() {
+                let mut deps = mock_dependencies();
+                let instantiate_msg = InstantiateMsg {
+                    name: "Cash Token".to_string(),
+                    symbol: "CASH".to_string(),
+                    decimals: 9,
+                    initial_balances: vec![],
+                    mint: None,
+                    marketing: Some(InstantiateMarketingInfo {
+                        project: Some("Project".to_owned()),
+                        description: Some("Description".to_owned()),
+                        marketing: Some("marketing".to_owned()),
+                        logo: Some(Logo::Url("url".to_owned())),
+                    }),
+                };
 
-        #[test]
-        fn fails_for_large_decimals() {
-            let mut deps = mock_dependencies(&[]);
-            let instantiate_msg = InstantiateMsg {
-                name: "Cash Token".to_string(),
-                symbol: "CASH".to_string(),
-                decimals: 42,
-                initial_balances: [].to_vec(),
-            };
-            let (env, info) = mock_env_height("creator", 450, 550);
-            let result = instantiate(deps.as_mut(), env, info, instantiate_msg);
-            match result {
-                Ok(_) => panic!("expected error"),
-                Err(ContractError::DecimalsExceeded {}) => {}
-                Err(e) => panic!("unexpected error: {:?}", e),
+                let info = mock_info("creator", &[]);
+                let env = mock_env();
+                let res = instantiate(deps.as_mut(), env, info, instantiate_msg).unwrap();
+                assert_eq!(0, res.messages.len());
+
+                assert_eq!(
+                    query_marketing_info(deps.as_ref()).unwrap(),
+                    MarketingInfoResponse {
+                        project: Some("Project".to_owned()),
+                        description: Some("Description".to_owned()),
+                        marketing: Some(Addr::unchecked("marketing")),
+                        logo: Some(LogoInfo::Url("url".to_owned())),
+                    }
+                );
+
+                let err = query_download_logo(deps.as_ref()).unwrap_err();
+                assert!(
+                    matches!(err, StdError::NotFound { .. }),
+                    "Expected StdError::NotFound, received {}",
+                    err
+                );
             }
-        }
 
-        #[test]
-        fn fails_for_name_too_short() {
-            let mut deps = mock_dependencies(&[]);
-            let instantiate_msg = InstantiateMsg {
-                name: "CC".to_string(),
-                symbol: "CASH".to_string(),
-                decimals: 9,
-                initial_balances: [].to_vec(),
-            };
-            let (env, info) = mock_env_height("creator", 450, 550);
-            let result = instantiate(deps.as_mut(), env, info, instantiate_msg);
-            match result {
-                Ok(_) => panic!("expected error"),
-                Err(ContractError::NameWrongFormat {}) => {}
-                Err(e) => panic!("unexpected error: {:?}", e),
-            }
-        }
+            #[test]
+            fn invalid_marketing() {
+                let mut deps = mock_dependencies();
+                let instantiate_msg = InstantiateMsg {
+                    name: "Cash Token".to_string(),
+                    symbol: "CASH".to_string(),
+                    decimals: 9,
+                    initial_balances: vec![],
+                    mint: None,
+                    marketing: Some(InstantiateMarketingInfo {
+                        project: Some("Project".to_owned()),
+                        description: Some("Description".to_owned()),
+                        marketing: Some("m".to_owned()),
+                        logo: Some(Logo::Url("url".to_owned())),
+                    }),
+                };
 
-        #[test]
-        fn fails_for_name_too_long() {
-            let mut deps = mock_dependencies(&[]);
-            let instantiate_msg = InstantiateMsg {
-                name: "Cash coin. Cash coin. Cash coin. Cash coin.".to_string(),
-                symbol: "CASH".to_string(),
-                decimals: 9,
-                initial_balances: [].to_vec(),
-            };
-            let (env, info) = mock_env_height("creator", 450, 550);
-            let result = instantiate(deps.as_mut(), env, info, instantiate_msg);
-            match result {
-                Ok(_) => panic!("expected error"),
-                Err(ContractError::NameWrongFormat {}) => {}
-                Err(e) => panic!("unexpected error: {:?}", e),
-            }
-        }
+                let info = mock_info("creator", &[]);
+                let env = mock_env();
+                instantiate(deps.as_mut(), env, info, instantiate_msg).unwrap_err();
 
-        #[test]
-        fn fails_for_symbol_too_short() {
-            let mut deps = mock_dependencies(&[]);
-            let instantiate_msg = InstantiateMsg {
-                name: "De De".to_string(),
-                symbol: "DD".to_string(),
-                decimals: 9,
-                initial_balances: [].to_vec(),
-            };
-            let (env, info) = mock_env_height("creator", 450, 550);
-            let result = instantiate(deps.as_mut(), env, info, instantiate_msg);
-            match result {
-                Ok(_) => panic!("expected error"),
-                Err(ContractError::TickerWrongSymbolFormat {}) => {}
-                Err(e) => panic!("unexpected error: {:?}", e),
-            }
-        }
-
-        #[test]
-        fn fails_for_symbol_too_long() {
-            let mut deps = mock_dependencies(&[]);
-            let instantiate_msg = InstantiateMsg {
-                name: "Super Coin".to_string(),
-                symbol: "SUPERCOIN".to_string(),
-                decimals: 9,
-                initial_balances: [].to_vec(),
-            };
-            let (env, info) = mock_env_height("creator", 450, 550);
-            let result = instantiate(deps.as_mut(), env, info, instantiate_msg);
-            match result {
-                Ok(_) => panic!("expected error"),
-                Err(ContractError::TickerWrongSymbolFormat {}) => {}
-                Err(e) => panic!("unexpected error: {:?}", e),
-            }
-        }
-
-        #[test]
-        fn fails_for_symbol_lowercase() {
-            let mut deps = mock_dependencies(&[]);
-            let instantiate_msg = InstantiateMsg {
-                name: "Cash Token".to_string(),
-                symbol: "CaSH".to_string(),
-                decimals: 9,
-                initial_balances: [].to_vec(),
-            };
-            let (env, info) = mock_env_height("creator", 450, 550);
-            let result = instantiate(deps.as_mut(), env, info, instantiate_msg);
-            match result {
-                Ok(_) => panic!("expected error"),
-                Err(ContractError::TickerWrongSymbolFormat {}) => {}
-                Err(e) => panic!("unexpected error: {:?}", e),
+                let err = query_download_logo(deps.as_ref()).unwrap_err();
+                assert!(
+                    matches!(err, StdError::NotFound { .. }),
+                    "Expected StdError::NotFound, received {}",
+                    err
+                );
             }
         }
     }
 
-    mod transfer {
-        use super::*;
-        use crate::error::ContractError;
-        use cosmwasm_std::attr;
+    #[test]
+    fn can_mint_by_minter() {
+        let mut deps = mock_dependencies();
 
-        fn make_instantiate_msg() -> InstantiateMsg {
-            InstantiateMsg {
-                name: "Cash Token".to_string(),
-                symbol: "CASH".to_string(),
-                decimals: 9,
-                initial_balances: vec![
-                    InitialBalance {
-                        address: "addr0000".to_string(),
-                        amount: Uint128::from(11u128),
-                    },
-                    InitialBalance {
-                        address: "addr1111".to_string(),
-                        amount: Uint128::from(22u128),
-                    },
-                    InitialBalance {
-                        address: "addrbbbb".to_string(),
-                        amount: Uint128::from(33u128),
-                    },
-                ],
-            }
-        }
+        let genesis = String::from("genesis");
+        let amount = Uint128::new(11223344);
+        let minter = String::from("asmodat");
+        let limit = Uint128::new(511223344);
+        do_instantiate_with_minter(deps.as_mut(), &genesis, amount, &minter, Some(limit));
 
-        #[test]
-        fn can_send_to_existing_recipient() {
-            let mut deps = mock_dependencies(&[]);
-            let instantiate_msg = make_instantiate_msg();
-            let (env, info) = mock_env_height("creator", 450, 550);
-            let res = instantiate(deps.as_mut(), env, info, instantiate_msg).unwrap();
-            assert_eq!(0, res.messages.len());
-            // Initial state
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr0000".to_string())),
-                11
-            );
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr1111".to_string())),
-                22
-            );
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addrbbbb".to_string())),
-                33
-            );
-            assert_eq!(get_total_supply(&deps.storage), 66);
-            // Transfer
-            let transfer_msg = ExecuteMsg::Transfer {
-                recipient: "addr1111".to_string(),
-                amount: Uint128::from(1u128),
-            };
-            let (env, info) = mock_env_height("addr0000", 450, 550);
-            let transfer_result = execute(deps.as_mut(), env, info, transfer_msg).unwrap();
-            assert_eq!(transfer_result.messages.len(), 0);
-            assert_eq!(
-                transfer_result.attributes,
-                vec![
-                    attr("action", "transfer"),
-                    attr("sender", "addr0000"),
-                    attr("recipient", "addr1111"),
-                ]
-            );
-            // New state
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr0000".to_string())),
-                10
-            ); // -1
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr1111".to_string())),
-                23
-            ); // +1
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addrbbbb".to_string())),
-                33
-            );
-            assert_eq!(get_total_supply(&deps.storage), 66);
-        }
+        // minter can mint coins to some winner
+        let winner = String::from("lucky");
+        let prize = Uint128::new(222_222_222);
+        let msg = ExecuteMsg::Mint {
+            recipient: winner.clone(),
+            amount: prize,
+        };
 
-        #[test]
-        fn can_send_to_non_existent_recipient() {
-            let mut deps = mock_dependencies(&[]);
-            let instantiate_msg = make_instantiate_msg();
-            let (env, info) = mock_env_height("creator", 450, 550);
-            let res = instantiate(deps.as_mut(), env, info, instantiate_msg).unwrap();
-            assert_eq!(0, res.messages.len());
-            // Initial state
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr0000".to_string())),
-                11
-            );
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr1111".to_string())),
-                22
-            );
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addrbbbb".to_string())),
-                33
-            );
-            assert_eq!(get_total_supply(&deps.storage), 66);
-            // Transfer
-            let transfer_msg = ExecuteMsg::Transfer {
-                recipient: "addr2323".to_string(),
-                amount: Uint128::from(1u128),
-            };
-            let (env, info) = mock_env_height("addr0000", 450, 550);
-            let transfer_result = execute(deps.as_mut(), env, info, transfer_msg).unwrap();
-            assert_eq!(transfer_result.messages.len(), 0);
-            assert_eq!(
-                transfer_result.attributes,
-                vec![
-                    attr("action", "transfer"),
-                    attr("sender", "addr0000"),
-                    attr("recipient", "addr2323"),
-                ]
-            );
-            // New state
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr0000".to_string())),
-                10
-            );
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr1111".to_string())),
-                22
-            );
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr2323".to_string())),
-                1
-            );
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addrbbbb".to_string())),
-                33
-            );
-            assert_eq!(get_total_supply(&deps.storage), 66);
-        }
+        let info = mock_info(minter.as_ref(), &[]);
+        let env = mock_env();
+        let res = execute(deps.as_mut(), env, info, msg).unwrap();
+        assert_eq!(0, res.messages.len());
+        assert_eq!(get_balance(deps.as_ref(), genesis), amount);
+        assert_eq!(get_balance(deps.as_ref(), winner.clone()), prize);
 
-        #[test]
-        fn can_send_zero_amount() {
-            let mut deps = mock_dependencies(&[]);
-            let instantiate_msg = make_instantiate_msg();
-            let (env, info) = mock_env_height("creator", 450, 550);
-            let res = instantiate(deps.as_mut(), env, info, instantiate_msg).unwrap();
-            assert_eq!(0, res.messages.len());
-            // Initial state
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr0000".to_string())),
-                11
-            );
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr1111".to_string())),
-                22
-            );
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addrbbbb".to_string())),
-                33
-            );
-            assert_eq!(get_total_supply(&deps.storage), 66);
-            // Transfer
-            let transfer_msg = ExecuteMsg::Transfer {
-                recipient: "addr1111".to_string(),
-                amount: Uint128::from(0u128),
-            };
-            let (env, info) = mock_env_height("addr0000", 450, 550);
-            let transfer_result = execute(deps.as_mut(), env, info, transfer_msg).unwrap();
-            assert_eq!(transfer_result.messages.len(), 0);
-            assert_eq!(
-                transfer_result.attributes,
-                vec![
-                    attr("action", "transfer"),
-                    attr("sender", "addr0000"),
-                    attr("recipient", "addr1111"),
-                ]
-            );
-            // New state (unchanged)
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr0000".to_string())),
-                11
-            );
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr1111".to_string())),
-                22
-            );
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addrbbbb".to_string())),
-                33
-            );
-            assert_eq!(get_total_supply(&deps.storage), 66);
-        }
+        // but cannot mint nothing
+        let msg = ExecuteMsg::Mint {
+            recipient: winner.clone(),
+            amount: Uint128::zero(),
+        };
+        let info = mock_info(minter.as_ref(), &[]);
+        let env = mock_env();
+        let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
+        assert_eq!(err, ContractError::InvalidZeroAmount {});
 
-        #[test]
-        fn can_send_to_sender() {
-            let mut deps = mock_dependencies(&[]);
-            let instantiate_msg = make_instantiate_msg();
-            let (env, info) = mock_env_height("creator", 450, 550);
-            let res = instantiate(deps.as_mut(), env, info, instantiate_msg).unwrap();
-            assert_eq!(0, res.messages.len());
-            let sender = "addr0000";
-            // Initial state
-            assert_eq!(get_balance(&deps.storage, &Addr::unchecked(sender)), 11);
-            // Transfer
-            let transfer_msg = ExecuteMsg::Transfer {
-                recipient: sender.to_string(),
-                amount: Uint128::from(3u128),
-            };
-            let (env, info) = mock_env_height(&sender, 450, 550);
-            let transfer_result = execute(deps.as_mut(), env, info, transfer_msg).unwrap();
-            assert_eq!(transfer_result.messages.len(), 0);
-            assert_eq!(
-                transfer_result.attributes,
-                vec![
-                    attr("action", "transfer"),
-                    attr("sender", "addr0000"),
-                    attr("recipient", "addr0000"),
-                ]
-            );
-            // New state
-            assert_eq!(get_balance(&deps.storage, &Addr::unchecked(sender)), 11);
-        }
-
-        #[test]
-        fn fails_on_insufficient_balance() {
-            let mut deps = mock_dependencies(&[]);
-            let instantiate_msg = make_instantiate_msg();
-            let (env, info) = mock_env_height("creator", 450, 550);
-            let res = instantiate(deps.as_mut(), env, info, instantiate_msg).unwrap();
-            assert_eq!(0, res.messages.len());
-            // Initial state
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr0000".to_string())),
-                11
-            );
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr1111".to_string())),
-                22
-            );
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addrbbbb".to_string())),
-                33
-            );
-            assert_eq!(get_total_supply(&deps.storage), 66);
-            // Transfer
-            let transfer_msg = ExecuteMsg::Transfer {
-                recipient: "addr1111".to_string(),
-                amount: Uint128::from(12u128),
-            };
-            let (env, info) = mock_env_height("addr0000", 450, 550);
-            let transfer_result = execute(deps.as_mut(), env, info, transfer_msg);
-            match transfer_result {
-                Ok(_) => panic!("expected error"),
-                Err(ContractError::InsufficientFunds {
-                    balance: 11,
-                    required: 12,
-                }) => {}
-                Err(e) => panic!("unexpected error: {:?}", e),
-            }
-            // New state (unchanged)
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr0000".to_string())),
-                11
-            );
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr1111".to_string())),
-                22
-            );
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addrbbbb".to_string())),
-                33
-            );
-            assert_eq!(get_total_supply(&deps.storage), 66);
-        }
+        // but if it exceeds cap (even over multiple rounds), it fails
+        // cap is enforced
+        let msg = ExecuteMsg::Mint {
+            recipient: winner,
+            amount: Uint128::new(333_222_222),
+        };
+        let info = mock_info(minter.as_ref(), &[]);
+        let env = mock_env();
+        let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
+        assert_eq!(err, ContractError::CannotExceedCap {});
     }
 
-    mod approve {
-        use super::*;
-        use cosmwasm_std::attr;
+    #[test]
+    fn others_cannot_mint() {
+        let mut deps = mock_dependencies();
+        do_instantiate_with_minter(
+            deps.as_mut(),
+            &String::from("genesis"),
+            Uint128::new(1234),
+            &String::from("minter"),
+            None,
+        );
 
-        fn make_instantiate_msg() -> InstantiateMsg {
-            InstantiateMsg {
-                name: "Cash Token".to_string(),
-                symbol: "CASH".to_string(),
-                decimals: 9,
-                initial_balances: vec![
-                    InitialBalance {
-                        address: "addr0000".to_string(),
-                        amount: Uint128::from(11u128),
-                    },
-                    InitialBalance {
-                        address: "addr1111".to_string(),
-                        amount: Uint128::from(22u128),
-                    },
-                    InitialBalance {
-                        address: "addrbbbb".to_string(),
-                        amount: Uint128::from(33u128),
-                    },
-                ],
-            }
-        }
-
-        fn make_spender() -> Addr {
-            Addr::unchecked("dadadadadadadada".to_string())
-        }
-
-        #[test]
-        fn has_zero_allowance_by_default() {
-            let mut deps = mock_dependencies(&[]);
-            let instantiate_msg = make_instantiate_msg();
-            let (env, info) = mock_env_height("creator", 450, 550);
-            let res = instantiate(deps.as_mut(), env, info, instantiate_msg).unwrap();
-            assert_eq!(0, res.messages.len());
-            // Existing owner
-            assert_eq!(
-                get_allowance(&deps.storage, &Addr::unchecked("addr0000"), &make_spender()),
-                0
-            );
-            // Non-existing owner
-            assert_eq!(
-                get_allowance(
-                    &deps.storage,
-                    &Addr::unchecked("addr4567".to_string()),
-                    &make_spender()
-                ),
-                0
-            );
-        }
-
-        #[test]
-        fn can_set_allowance() {
-            let mut deps = mock_dependencies(&[]);
-            let instantiate_msg = make_instantiate_msg();
-            let (env, info) = mock_env_height("creator", 450, 550);
-            let res = instantiate(deps.as_mut(), env, info, instantiate_msg).unwrap();
-            assert_eq!(0, res.messages.len());
-            assert_eq!(
-                get_allowance(
-                    &deps.storage,
-                    &Addr::unchecked("addr7654".to_string()),
-                    &make_spender()
-                ),
-                0
-            );
-            // First approval
-            let owner = Addr::unchecked("addr7654".to_string());
-            let spender = make_spender();
-            let approve_msg1 = ExecuteMsg::Approve {
-                spender: spender.clone().to_string().to_string(),
-                amount: Uint128::from(334422u128),
-            };
-            let (env, info) = mock_env_height(&owner.as_str(), 450, 550);
-            let approve_result1 = execute(deps.as_mut(), env, info, approve_msg1).unwrap();
-            assert_eq!(approve_result1.messages.len(), 0);
-            assert_eq!(
-                approve_result1.attributes,
-                vec![
-                    attr("action", "approve"),
-                    attr("owner", owner.clone().to_string()),
-                    attr("spender", spender.clone().to_string()),
-                ]
-            );
-            assert_eq!(
-                get_allowance(&deps.storage, &owner, &make_spender()),
-                334422
-            );
-            // Updated approval
-            let approve_msg = ExecuteMsg::Approve {
-                spender: spender.clone().to_string().to_string(),
-                amount: Uint128::from(777888u128),
-            };
-            let (env, info) = mock_env_height(&owner.as_str(), 450, 550);
-            let approve_result2 = execute(deps.as_mut(), env, info, approve_msg).unwrap();
-            assert_eq!(approve_result2.messages.len(), 0);
-            assert_eq!(
-                approve_result2.attributes,
-                vec![
-                    attr("action", "approve"),
-                    attr("owner", owner.as_str()),
-                    attr("spender", spender.as_str()),
-                ]
-            );
-            assert_eq!(get_allowance(&deps.storage, &owner, &spender), 777888);
-        }
+        let msg = ExecuteMsg::Mint {
+            recipient: String::from("lucky"),
+            amount: Uint128::new(222),
+        };
+        let info = mock_info("anyone else", &[]);
+        let env = mock_env();
+        let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
+        assert_eq!(err, ContractError::Unauthorized {});
     }
 
-    mod transfer_from {
-        use super::*;
-        use crate::error::ContractError;
-        use cosmwasm_std::{attr, Addr};
+    #[test]
+    fn no_one_mints_if_minter_unset() {
+        let mut deps = mock_dependencies();
+        do_instantiate(deps.as_mut(), &String::from("genesis"), Uint128::new(1234));
 
-        fn make_instantiate_msg() -> InstantiateMsg {
-            InstantiateMsg {
-                name: "Cash Token".to_string(),
-                symbol: "CASH".to_string(),
-                decimals: 9,
-                initial_balances: vec![
-                    InitialBalance {
-                        address: "addr0000".to_string(),
-                        amount: Uint128::from(11u128),
-                    },
-                    InitialBalance {
-                        address: "addr1111".to_string(),
-                        amount: Uint128::from(22u128),
-                    },
-                    InitialBalance {
-                        address: "addrbbbb".to_string(),
-                        amount: Uint128::from(33u128),
-                    },
-                ],
-            }
-        }
-
-        fn make_spender() -> Addr {
-            Addr::unchecked("dadadadadadadada".to_string())
-        }
-
-        #[test]
-        fn works() {
-            let mut deps = mock_dependencies(&[]);
-            let instantiate_msg = make_instantiate_msg();
-            let (env, info) = mock_env_height("creator", 450, 550);
-            let res = instantiate(deps.as_mut(), env, info, instantiate_msg).unwrap();
-            assert_eq!(0, res.messages.len());
-            let owner = "addr0000";
-            let spender = make_spender();
-            let recipient = Addr::unchecked("addr1212".to_string());
-            // Set approval
-            let approve_msg = ExecuteMsg::Approve {
-                spender: spender.clone().to_string().to_string(),
-                amount: Uint128::from(4u128),
-            };
-            let (env, info) = mock_env_height(&owner.clone(), 450, 550);
-            let approve_result = execute(deps.as_mut(), env, info, approve_msg).unwrap();
-            assert_eq!(approve_result.messages.len(), 0);
-            assert_eq!(
-                approve_result.attributes,
-                vec![
-                    attr("action", "approve"),
-                    attr("owner", owner.clone().to_string()),
-                    attr("spender", spender.clone().to_string()),
-                ]
-            );
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked(owner.clone())),
-                11
-            );
-            assert_eq!(
-                get_allowance(&deps.storage, &Addr::unchecked(owner.clone()), &spender),
-                4
-            );
-            // Transfer less than allowance but more than balance
-            let transfer_from_msg = ExecuteMsg::TransferFrom {
-                owner: owner.clone().to_string().to_string(),
-                recipient: recipient.clone().to_string(),
-                amount: Uint128::from(3u128),
-            };
-            let (env, info) = mock_env_height(&spender.as_str(), 450, 550);
-            let transfer_from_result =
-                execute(deps.as_mut(), env, info, transfer_from_msg).unwrap();
-            assert_eq!(transfer_from_result.messages.len(), 0);
-            assert_eq!(
-                transfer_from_result.attributes,
-                vec![
-                    attr("action", "transfer_from"),
-                    attr("spender", spender.clone()),
-                    attr("sender", owner),
-                    attr("recipient", recipient),
-                ]
-            );
-            // State changed
-            assert_eq!(get_balance(&deps.storage, &Addr::unchecked(owner)), 8);
-            assert_eq!(
-                get_allowance(&deps.storage, &Addr::unchecked(owner), &spender),
-                1
-            );
-        }
-
-        #[test]
-        fn fails_when_allowance_too_low() {
-            let mut deps = mock_dependencies(&[]);
-            let instantiate_msg = make_instantiate_msg();
-            let (env, info) = mock_env_height("creator", 450, 550);
-            let res = instantiate(deps.as_mut(), env, info, instantiate_msg).unwrap();
-            assert_eq!(0, res.messages.len());
-            let owner = "addr0000";
-            let spender = make_spender();
-            let recipient = Addr::unchecked("addr1212".to_string());
-            // Set approval
-            let approve_msg = ExecuteMsg::Approve {
-                spender: spender.clone().to_string(),
-                amount: Uint128::from(2u128),
-            };
-            let (env, info) = mock_env_height(&owner.clone(), 450, 550);
-            let approve_result = execute(deps.as_mut(), env, info, approve_msg).unwrap();
-            assert_eq!(approve_result.messages.len(), 0);
-            assert_eq!(
-                approve_result.attributes,
-                vec![
-                    attr("action", "approve"),
-                    attr("owner", owner.clone().to_string()),
-                    attr("spender", spender.clone().to_string()),
-                ]
-            );
-            assert_eq!(get_balance(&deps.storage, &Addr::unchecked(owner)), 11);
-            assert_eq!(
-                get_allowance(&deps.storage, &Addr::unchecked(owner), &spender),
-                2
-            );
-            // Transfer less than allowance but more than balance
-            let fransfer_from_msg = ExecuteMsg::TransferFrom {
-                owner: owner.clone().to_string(),
-                recipient: recipient.clone().to_string(),
-                amount: Uint128::from(3u128),
-            };
-            let (env, info) = mock_env_height(&spender.as_str(), 450, 550);
-            let transfer_result = execute(deps.as_mut(), env, info, fransfer_from_msg);
-            match transfer_result {
-                Ok(_) => panic!("expected error"),
-                Err(ContractError::InsufficientAllowance {
-                    allowance: 2,
-                    required: 3,
-                }) => {}
-                Err(e) => panic!("unexpected error: {:?}", e),
-            }
-        }
-
-        #[test]
-        fn fails_when_allowance_is_set_but_balance_too_low() {
-            let mut deps = mock_dependencies(&[]);
-            let instantiate_msg = make_instantiate_msg();
-            let (env, info) = mock_env_height("creator", 450, 550);
-            let res = instantiate(deps.as_mut(), env, info, instantiate_msg).unwrap();
-            assert_eq!(0, res.messages.len());
-            let owner = "addr0000";
-            let spender = make_spender();
-            let recipient = Addr::unchecked("addr1212".to_string());
-            // Set approval
-            let approve_msg = ExecuteMsg::Approve {
-                spender: spender.clone().to_string(),
-                amount: Uint128::from(20u128),
-            };
-            let (env, info) = mock_env_height(&owner.clone(), 450, 550);
-            let approve_result = execute(deps.as_mut(), env, info, approve_msg).unwrap();
-            assert_eq!(approve_result.messages.len(), 0);
-            assert_eq!(
-                approve_result.attributes,
-                vec![
-                    attr("action", "approve"),
-                    attr("owner", owner.clone().to_string()),
-                    attr("spender", spender.clone().to_string()),
-                ]
-            );
-            assert_eq!(get_balance(&deps.storage, &Addr::unchecked(owner)), 11);
-            assert_eq!(
-                get_allowance(&deps.storage, &Addr::unchecked(owner), &spender),
-                20
-            );
-            // Transfer less than allowance but more than balance
-            let fransfer_from_msg = ExecuteMsg::TransferFrom {
-                owner: owner.clone().to_string(),
-                recipient: recipient.clone().to_string(),
-                amount: Uint128::from(15u128),
-            };
-            let (env, info) = mock_env_height(&spender.as_str(), 450, 550);
-            let transfer_result = execute(deps.as_mut(), env, info, fransfer_from_msg);
-            match transfer_result {
-                Ok(_) => panic!("expected error"),
-                Err(ContractError::InsufficientFunds {
-                    balance: 11,
-                    required: 15,
-                }) => {}
-                Err(e) => panic!("unexpected error: {:?}", e),
-            }
-        }
+        let msg = ExecuteMsg::Mint {
+            recipient: String::from("lucky"),
+            amount: Uint128::new(222),
+        };
+        let info = mock_info("genesis", &[]);
+        let env = mock_env();
+        let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
+        assert_eq!(err, ContractError::Unauthorized {});
     }
 
-    mod burn {
-        use super::*;
-        use crate::error::ContractError;
-        use cosmwasm_std::{attr, Addr};
+    #[test]
+    fn instantiate_multiple_accounts() {
+        let mut deps = mock_dependencies();
+        let amount1 = Uint128::from(11223344u128);
+        let addr1 = String::from("addr0001");
+        let amount2 = Uint128::from(7890987u128);
+        let addr2 = String::from("addr0002");
+        let info = mock_info("creator", &[]);
+        let env = mock_env();
 
-        fn make_instantiate_msg() -> InstantiateMsg {
-            InstantiateMsg {
-                name: "Cash Token".to_string(),
-                symbol: "CASH".to_string(),
-                decimals: 9,
-                initial_balances: vec![
-                    InitialBalance {
-                        address: "addr0000".to_string(),
-                        amount: Uint128::from(11u128),
-                    },
-                    InitialBalance {
-                        address: "addr1111".to_string(),
-                        amount: Uint128::from(22u128),
-                    },
-                ],
+        // Fails with duplicate addresses
+        let instantiate_msg = InstantiateMsg {
+            name: "Bash Shell".to_string(),
+            symbol: "BASH".to_string(),
+            decimals: 6,
+            initial_balances: vec![
+                Cw20Coin {
+                    address: addr1.clone(),
+                    amount: amount1,
+                },
+                Cw20Coin {
+                    address: addr1.clone(),
+                    amount: amount2,
+                },
+            ],
+            mint: None,
+            marketing: None,
+        };
+        let err =
+            instantiate(deps.as_mut(), env.clone(), info.clone(), instantiate_msg).unwrap_err();
+        assert_eq!(err, ContractError::DuplicateInitialBalanceAddresses {});
+
+        // Works with unique addresses
+        let instantiate_msg = InstantiateMsg {
+            name: "Bash Shell".to_string(),
+            symbol: "BASH".to_string(),
+            decimals: 6,
+            initial_balances: vec![
+                Cw20Coin {
+                    address: addr1.clone(),
+                    amount: amount1,
+                },
+                Cw20Coin {
+                    address: addr2.clone(),
+                    amount: amount2,
+                },
+            ],
+            mint: None,
+            marketing: None,
+        };
+        let res = instantiate(deps.as_mut(), env, info, instantiate_msg).unwrap();
+        assert_eq!(0, res.messages.len());
+        assert_eq!(
+            query_token_info(deps.as_ref()).unwrap(),
+            TokenInfoResponse {
+                name: "Bash Shell".to_string(),
+                symbol: "BASH".to_string(),
+                decimals: 6,
+                total_supply: amount1 + amount2,
             }
-        }
-
-        #[test]
-        fn can_burn_from_existing_account() {
-            let mut deps = mock_dependencies(&[]);
-            let instantiate_msg = make_instantiate_msg();
-            let (env, info) = mock_env_height("creator", 450, 550);
-            let res = instantiate(deps.as_mut(), env, info, instantiate_msg).unwrap();
-            assert_eq!(0, res.messages.len());
-            // Initial state
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr0000".to_string())),
-                11
-            );
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr1111".to_string())),
-                22
-            );
-            assert_eq!(get_total_supply(&deps.storage), 33);
-            // Burn
-            let burn_msg = ExecuteMsg::Burn {
-                amount: Uint128::from(1u128),
-            };
-            let (env, info) = mock_env_height("addr0000", 450, 550);
-            let burn_result = execute(deps.as_mut(), env, info, burn_msg).unwrap();
-            assert_eq!(burn_result.messages.len(), 0);
-            assert_eq!(
-                burn_result.attributes,
-                vec![
-                    attr("action", "burn"),
-                    attr("account", "addr0000"),
-                    attr("amount", "1")
-                ]
-            );
-            // New state
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr0000".to_string())),
-                10
-            ); // -1
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr1111".to_string())),
-                22
-            );
-            assert_eq!(get_total_supply(&deps.storage), 32);
-        }
-
-        #[test]
-        fn can_burn_zero_amount() {
-            let mut deps = mock_dependencies(&[]);
-            let instantiate_msg = make_instantiate_msg();
-            let (env, info) = mock_env_height("creator", 450, 550);
-            let res = instantiate(deps.as_mut(), env, info, instantiate_msg).unwrap();
-            assert_eq!(0, res.messages.len());
-            // Initial state
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr0000".to_string())),
-                11
-            );
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr1111".to_string())),
-                22
-            );
-            assert_eq!(get_total_supply(&deps.storage), 33);
-            // Burn
-            let burn_msg = ExecuteMsg::Burn {
-                amount: Uint128::from(0u128),
-            };
-            let (env, info) = mock_env_height("addr0000", 450, 550);
-            let burn_result = execute(deps.as_mut(), env, info, burn_msg).unwrap();
-            assert_eq!(burn_result.messages.len(), 0);
-            assert_eq!(
-                burn_result.attributes,
-                vec![
-                    attr("action", "burn"),
-                    attr("account", "addr0000"),
-                    attr("amount", "0"),
-                ]
-            );
-            // New state (unchanged)
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr0000".to_string())),
-                11
-            );
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr1111".to_string())),
-                22
-            );
-            assert_eq!(get_total_supply(&deps.storage), 33);
-        }
-
-        #[test]
-        fn fails_on_insufficient_balance() {
-            let mut deps = mock_dependencies(&[]);
-            let instantiate_msg = make_instantiate_msg();
-            let (env, info) = mock_env_height("creator", 450, 550);
-            let res = instantiate(deps.as_mut(), env, info, instantiate_msg).unwrap();
-            assert_eq!(0, res.messages.len());
-            // Initial state
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr0000".to_string())),
-                11
-            );
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr1111".to_string())),
-                22
-            );
-            assert_eq!(get_total_supply(&deps.storage), 33);
-            // Burn
-            let burn_msg = ExecuteMsg::Burn {
-                amount: Uint128::from(12u128),
-            };
-            let (env, info) = mock_env_height("addr0000", 450, 550);
-            let burn_result = execute(deps.as_mut(), env, info, burn_msg);
-            match burn_result {
-                Ok(_) => panic!("expected error"),
-                Err(ContractError::InsufficientFunds {
-                    balance: 11,
-                    required: 12,
-                }) => {}
-                Err(e) => panic!("unexpected error: {:?}", e),
-            }
-            // New state (unchanged)
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr0000".to_string())),
-                11
-            );
-            assert_eq!(
-                get_balance(&deps.storage, &Addr::unchecked("addr1111".to_string())),
-                22
-            );
-            assert_eq!(get_total_supply(&deps.storage), 33);
-        }
+        );
+        assert_eq!(get_balance(deps.as_ref(), addr1), amount1);
+        assert_eq!(get_balance(deps.as_ref(), addr2), amount2);
     }
 
-    mod query {
-        use super::*;
-        use cosmwasm_std::{attr, Addr};
+    #[test]
+    fn queries_work() {
+        let mut deps = mock_dependencies_with_balance(&coins(2, "token"));
+        let addr1 = String::from("addr0001");
+        let amount1 = Uint128::from(12340000u128);
 
-        fn address(index: u8) -> Addr {
-            match index {
-                0 => Addr::unchecked("addr0000".to_string()), // contract instantiateializer
-                1 => Addr::unchecked("addr1111".to_string()),
-                2 => Addr::unchecked("addr4321".to_string()),
-                3 => Addr::unchecked("addr5432".to_string()),
-                4 => Addr::unchecked("addr6543".to_string()),
-                _ => panic!("Unsupported address index"),
-            }
+        let expected = do_instantiate(deps.as_mut(), &addr1, amount1);
+
+        // check meta query
+        let loaded = query_token_info(deps.as_ref()).unwrap();
+        assert_eq!(expected, loaded);
+
+        let _info = mock_info("test", &[]);
+        let env = mock_env();
+        // check balance query (full)
+        let data = query(
+            deps.as_ref(),
+            env.clone(),
+            QueryMsg::Balance { address: addr1 },
+        )
+        .unwrap();
+        let loaded: BalanceResponse = from_binary(&data).unwrap();
+        assert_eq!(loaded.balance, amount1);
+
+        // check balance query (empty)
+        let data = query(
+            deps.as_ref(),
+            env,
+            QueryMsg::Balance {
+                address: String::from("addr0002"),
+            },
+        )
+        .unwrap();
+        let loaded: BalanceResponse = from_binary(&data).unwrap();
+        assert_eq!(loaded.balance, Uint128::zero());
+    }
+
+    #[test]
+    fn transfer() {
+        let mut deps = mock_dependencies_with_balance(&coins(2, "token"));
+        let addr1 = String::from("addr0001");
+        let addr2 = String::from("addr0002");
+        let amount1 = Uint128::from(12340000u128);
+        let transfer = Uint128::from(76543u128);
+        let too_much = Uint128::from(12340321u128);
+
+        do_instantiate(deps.as_mut(), &addr1, amount1);
+
+        // cannot transfer nothing
+        let info = mock_info(addr1.as_ref(), &[]);
+        let env = mock_env();
+        let msg = ExecuteMsg::Transfer {
+            recipient: addr2.clone(),
+            amount: Uint128::zero(),
+        };
+        let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
+        assert_eq!(err, ContractError::InvalidZeroAmount {});
+
+        // cannot send more than we have
+        let info = mock_info(addr1.as_ref(), &[]);
+        let env = mock_env();
+        let msg = ExecuteMsg::Transfer {
+            recipient: addr2.clone(),
+            amount: too_much,
+        };
+        let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
+        assert!(matches!(err, ContractError::Std(StdError::Overflow { .. })));
+
+        // cannot send from empty account
+        let info = mock_info(addr2.as_ref(), &[]);
+        let env = mock_env();
+        let msg = ExecuteMsg::Transfer {
+            recipient: addr1.clone(),
+            amount: transfer,
+        };
+        let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
+        assert!(matches!(err, ContractError::Std(StdError::Overflow { .. })));
+
+        // valid transfer
+        let info = mock_info(addr1.as_ref(), &[]);
+        let env = mock_env();
+        let msg = ExecuteMsg::Transfer {
+            recipient: addr2.clone(),
+            amount: transfer,
+        };
+        let res = execute(deps.as_mut(), env, info, msg).unwrap();
+        assert_eq!(res.messages.len(), 0);
+
+        let remainder = amount1.checked_sub(transfer).unwrap();
+        assert_eq!(get_balance(deps.as_ref(), addr1), remainder);
+        assert_eq!(get_balance(deps.as_ref(), addr2), transfer);
+        assert_eq!(
+            query_token_info(deps.as_ref()).unwrap().total_supply,
+            amount1
+        );
+    }
+
+    #[test]
+    fn burn() {
+        let mut deps = mock_dependencies_with_balance(&coins(2, "token"));
+        let addr1 = String::from("addr0001");
+        let amount1 = Uint128::from(12340000u128);
+        let burn = Uint128::from(76543u128);
+        let too_much = Uint128::from(12340321u128);
+
+        do_instantiate(deps.as_mut(), &addr1, amount1);
+
+        // cannot burn nothing
+        let info = mock_info(addr1.as_ref(), &[]);
+        let env = mock_env();
+        let msg = ExecuteMsg::Burn {
+            amount: Uint128::zero(),
+        };
+        let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
+        assert_eq!(err, ContractError::InvalidZeroAmount {});
+        assert_eq!(
+            query_token_info(deps.as_ref()).unwrap().total_supply,
+            amount1
+        );
+
+        // cannot burn more than we have
+        let info = mock_info(addr1.as_ref(), &[]);
+        let env = mock_env();
+        let msg = ExecuteMsg::Burn { amount: too_much };
+        let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
+        assert!(matches!(err, ContractError::Std(StdError::Overflow { .. })));
+        assert_eq!(
+            query_token_info(deps.as_ref()).unwrap().total_supply,
+            amount1
+        );
+
+        // valid burn reduces total supply
+        let info = mock_info(addr1.as_ref(), &[]);
+        let env = mock_env();
+        let msg = ExecuteMsg::Burn { amount: burn };
+        let res = execute(deps.as_mut(), env, info, msg).unwrap();
+        assert_eq!(res.messages.len(), 0);
+
+        let remainder = amount1.checked_sub(burn).unwrap();
+        assert_eq!(get_balance(deps.as_ref(), addr1), remainder);
+        assert_eq!(
+            query_token_info(deps.as_ref()).unwrap().total_supply,
+            remainder
+        );
+    }
+
+    #[test]
+    fn send() {
+        let mut deps = mock_dependencies_with_balance(&coins(2, "token"));
+        let addr1 = String::from("addr0001");
+        let contract = String::from("addr0002");
+        let amount1 = Uint128::from(12340000u128);
+        let transfer = Uint128::from(76543u128);
+        let too_much = Uint128::from(12340321u128);
+        let send_msg = Binary::from(r#"{"some":123}"#.as_bytes());
+
+        do_instantiate(deps.as_mut(), &addr1, amount1);
+
+        // cannot send nothing
+        let info = mock_info(addr1.as_ref(), &[]);
+        let env = mock_env();
+        let msg = ExecuteMsg::Send {
+            contract: contract.clone(),
+            amount: Uint128::zero(),
+            msg: send_msg.clone(),
+        };
+        let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
+        assert_eq!(err, ContractError::InvalidZeroAmount {});
+
+        // cannot send more than we have
+        let info = mock_info(addr1.as_ref(), &[]);
+        let env = mock_env();
+        let msg = ExecuteMsg::Send {
+            contract: contract.clone(),
+            amount: too_much,
+            msg: send_msg.clone(),
+        };
+        let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
+        assert!(matches!(err, ContractError::Std(StdError::Overflow { .. })));
+
+        // valid transfer
+        let info = mock_info(addr1.as_ref(), &[]);
+        let env = mock_env();
+        let msg = ExecuteMsg::Send {
+            contract: contract.clone(),
+            amount: transfer,
+            msg: send_msg.clone(),
+        };
+        let res = execute(deps.as_mut(), env, info, msg).unwrap();
+        assert_eq!(res.messages.len(), 1);
+
+        // ensure proper send message sent
+        // this is the message we want delivered to the other side
+        let binary_msg = Cw20ReceiveMsg {
+            sender: addr1.clone(),
+            amount: transfer,
+            msg: send_msg,
         }
+        .into_binary()
+        .unwrap();
+        // and this is how it must be wrapped for the vm to process it
+        assert_eq!(
+            res.messages[0],
+            SubMsg::new(CosmosMsg::Wasm(WasmMsg::Execute {
+                contract_addr: contract.clone(),
+                msg: binary_msg,
+                funds: vec![],
+            }))
+        );
 
-        fn make_instantiate_msg() -> InstantiateMsg {
-            InstantiateMsg {
+        // ensure balance is properly transferred
+        let remainder = amount1.checked_sub(transfer).unwrap();
+        assert_eq!(get_balance(deps.as_ref(), addr1), remainder);
+        assert_eq!(get_balance(deps.as_ref(), contract), transfer);
+        assert_eq!(
+            query_token_info(deps.as_ref()).unwrap().total_supply,
+            amount1
+        );
+    }
+
+    mod marketing {
+        use super::*;
+
+        #[test]
+        fn update_unauthorised() {
+            let mut deps = mock_dependencies();
+            let instantiate_msg = InstantiateMsg {
                 name: "Cash Token".to_string(),
                 symbol: "CASH".to_string(),
                 decimals: 9,
-                initial_balances: vec![
-                    InitialBalance {
-                        address: address(1).to_string(),
-                        amount: Uint128::from(11u128),
-                    },
-                    InitialBalance {
-                        address: address(2).to_string(),
-                        amount: Uint128::from(22u128),
-                    },
-                    InitialBalance {
-                        address: address(3).to_string(),
-                        amount: Uint128::from(33u128),
-                    },
-                ],
-            }
-        }
-
-        #[test]
-        fn can_query_balance_of_existing_address() {
-            let mut deps = mock_dependencies(&[]);
-            let instantiate_msg = make_instantiate_msg();
-            let (env, info) = mock_env_height(&address(0).as_str(), 450, 550);
-            let res = instantiate(deps.as_mut(), env.clone(), info, instantiate_msg).unwrap();
-            assert_eq!(0, res.messages.len());
-            let query_msg = QueryMsg::Balance {
-                address: address(1).to_string(),
+                initial_balances: vec![],
+                mint: None,
+                marketing: Some(InstantiateMarketingInfo {
+                    project: Some("Project".to_owned()),
+                    description: Some("Description".to_owned()),
+                    marketing: Some("marketing".to_owned()),
+                    logo: Some(Logo::Url("url".to_owned())),
+                }),
             };
-            let query_result = query(deps.as_ref(), env, query_msg).unwrap();
-            assert_eq!(query_result.as_slice(), b"{\"balance\":\"11\"}");
-        }
 
-        #[test]
-        fn can_query_balance_of_nonexisting_address() {
-            let mut deps = mock_dependencies(&[]);
-            let instantiate_msg = make_instantiate_msg();
-            let (env, info) = mock_env_height(&address(0).as_str(), 450, 550);
-            let res = instantiate(deps.as_mut(), env.clone(), info, instantiate_msg).unwrap();
-            assert_eq!(0, res.messages.len());
-            let query_msg = QueryMsg::Balance {
-                address: address(4).to_string(), // only indices 1, 2, 3 are instantiateialized
-            };
-            let query_result = query(deps.as_ref(), env, query_msg).unwrap();
-            assert_eq!(query_result.as_slice(), b"{\"balance\":\"0\"}");
-        }
+            let info = mock_info("creator", &[]);
 
-        #[test]
-        fn can_query_allowance_of_existing_addresses() {
-            let mut deps = mock_dependencies(&[]);
-            let instantiate_msg = make_instantiate_msg();
-            let (env, info) = mock_env_height(&address(0).as_str(), 450, 550);
-            let res = instantiate(deps.as_mut(), env, info, instantiate_msg).unwrap();
-            assert_eq!(0, res.messages.len());
-            let owner = address(2);
-            let spender = address(1);
-            let approve_msg = ExecuteMsg::Approve {
-                spender: spender.clone().to_string(),
-                amount: Uint128::from(42u128),
-            };
-            let (env, info) = mock_env_height(&owner.as_str(), 450, 550);
-            let action_result = execute(deps.as_mut(), env.clone(), info, approve_msg).unwrap();
-            assert_eq!(action_result.messages.len(), 0);
+            instantiate(deps.as_mut(), mock_env(), info.clone(), instantiate_msg).unwrap();
+
+            let err = execute(
+                deps.as_mut(),
+                mock_env(),
+                info,
+                ExecuteMsg::UpdateMarketing {
+                    project: Some("New project".to_owned()),
+                    description: Some("Better description".to_owned()),
+                    marketing: Some("creator".to_owned()),
+                },
+            )
+            .unwrap_err();
+
+            assert_eq!(err, ContractError::Unauthorized {});
+
+            // Ensure marketing didn't change
             assert_eq!(
-                action_result.attributes,
-                vec![
-                    attr("action", "approve"),
-                    attr("owner", owner.clone().to_string()),
-                    attr("spender", spender.clone().to_string()),
-                ]
+                query_marketing_info(deps.as_ref()).unwrap(),
+                MarketingInfoResponse {
+                    project: Some("Project".to_owned()),
+                    description: Some("Description".to_owned()),
+                    marketing: Some(Addr::unchecked("marketing")),
+                    logo: Some(LogoInfo::Url("url".to_owned())),
+                }
             );
-            let query_msg = QueryMsg::Allowance {
-                owner: owner.clone().to_string(),
-                spender: spender.clone().to_string(),
-            };
-            let query_result = query(deps.as_ref(), env.clone(), query_msg).unwrap();
-            assert_eq!(query_result.as_slice(), b"{\"allowance\":\"42\"}");
+
+            let err = query_download_logo(deps.as_ref()).unwrap_err();
+            assert!(
+                matches!(err, StdError::NotFound { .. }),
+                "Expected StdError::NotFound, received {}",
+                err
+            );
         }
 
         #[test]
-        fn can_query_allowance_of_nonexisting_owner() {
-            let mut deps = mock_dependencies(&[]);
-            let instantiate_msg = make_instantiate_msg();
-            let (env, info) = mock_env_height(&address(0).as_str(), 450, 550);
-            let res = instantiate(deps.as_mut(), env, info, instantiate_msg).unwrap();
-            assert_eq!(0, res.messages.len());
-            let owner = address(2);
-            let spender = address(1);
-            let bob = address(3);
-            let approve_msg = ExecuteMsg::Approve {
-                spender: spender.clone().to_string(),
-                amount: Uint128::from(42u128),
+        fn update_project() {
+            let mut deps = mock_dependencies();
+            let instantiate_msg = InstantiateMsg {
+                name: "Cash Token".to_string(),
+                symbol: "CASH".to_string(),
+                decimals: 9,
+                initial_balances: vec![],
+                mint: None,
+                marketing: Some(InstantiateMarketingInfo {
+                    project: Some("Project".to_owned()),
+                    description: Some("Description".to_owned()),
+                    marketing: Some("creator".to_owned()),
+                    logo: Some(Logo::Url("url".to_owned())),
+                }),
             };
-            let (env, info) = mock_env_height(&owner.as_str(), 450, 550);
-            let approve_result = execute(deps.as_mut(), env.clone(), info, approve_msg).unwrap();
-            assert_eq!(approve_result.messages.len(), 0);
+
+            let info = mock_info("creator", &[]);
+
+            instantiate(deps.as_mut(), mock_env(), info.clone(), instantiate_msg).unwrap();
+
+            let res = execute(
+                deps.as_mut(),
+                mock_env(),
+                info,
+                ExecuteMsg::UpdateMarketing {
+                    project: Some("New project".to_owned()),
+                    description: None,
+                    marketing: None,
+                },
+            )
+            .unwrap();
+
+            assert_eq!(res.messages, vec![]);
+
             assert_eq!(
-                approve_result.attributes,
-                vec![
-                    attr("action", "approve"),
-                    attr("owner", owner.clone().to_string()),
-                    attr("spender", spender.clone().to_string()),
-                ]
+                query_marketing_info(deps.as_ref()).unwrap(),
+                MarketingInfoResponse {
+                    project: Some("New project".to_owned()),
+                    description: Some("Description".to_owned()),
+                    marketing: Some(Addr::unchecked("creator")),
+                    logo: Some(LogoInfo::Url("url".to_owned())),
+                }
             );
-            // different spender
-            let query_msg = QueryMsg::Allowance {
-                owner: owner.clone().to_string(),
-                spender: bob.clone().to_string(),
+
+            let err = query_download_logo(deps.as_ref()).unwrap_err();
+            assert!(
+                matches!(err, StdError::NotFound { .. }),
+                "Expected StdError::NotFound, received {}",
+                err
+            );
+        }
+
+        #[test]
+        fn clear_project() {
+            let mut deps = mock_dependencies();
+            let instantiate_msg = InstantiateMsg {
+                name: "Cash Token".to_string(),
+                symbol: "CASH".to_string(),
+                decimals: 9,
+                initial_balances: vec![],
+                mint: None,
+                marketing: Some(InstantiateMarketingInfo {
+                    project: Some("Project".to_owned()),
+                    description: Some("Description".to_owned()),
+                    marketing: Some("creator".to_owned()),
+                    logo: Some(Logo::Url("url".to_owned())),
+                }),
             };
-            let query_result = query(deps.as_ref(), env.clone(), query_msg).unwrap();
-            assert_eq!(query_result.as_slice(), b"{\"allowance\":\"0\"}");
-            // differnet owner
-            let query_msg = QueryMsg::Allowance {
-                owner: bob.clone().to_string(),
-                spender: spender.clone().to_string(),
+
+            let info = mock_info("creator", &[]);
+
+            instantiate(deps.as_mut(), mock_env(), info.clone(), instantiate_msg).unwrap();
+
+            let res = execute(
+                deps.as_mut(),
+                mock_env(),
+                info,
+                ExecuteMsg::UpdateMarketing {
+                    project: Some("".to_owned()),
+                    description: None,
+                    marketing: None,
+                },
+            )
+            .unwrap();
+
+            assert_eq!(res.messages, vec![]);
+
+            assert_eq!(
+                query_marketing_info(deps.as_ref()).unwrap(),
+                MarketingInfoResponse {
+                    project: None,
+                    description: Some("Description".to_owned()),
+                    marketing: Some(Addr::unchecked("creator")),
+                    logo: Some(LogoInfo::Url("url".to_owned())),
+                }
+            );
+
+            let err = query_download_logo(deps.as_ref()).unwrap_err();
+            assert!(
+                matches!(err, StdError::NotFound { .. }),
+                "Expected StdError::NotFound, received {}",
+                err
+            );
+        }
+
+        #[test]
+        fn update_description() {
+            let mut deps = mock_dependencies();
+            let instantiate_msg = InstantiateMsg {
+                name: "Cash Token".to_string(),
+                symbol: "CASH".to_string(),
+                decimals: 9,
+                initial_balances: vec![],
+                mint: None,
+                marketing: Some(InstantiateMarketingInfo {
+                    project: Some("Project".to_owned()),
+                    description: Some("Description".to_owned()),
+                    marketing: Some("creator".to_owned()),
+                    logo: Some(Logo::Url("url".to_owned())),
+                }),
             };
-            let query_result = query(deps.as_ref(), env.clone(), query_msg).unwrap();
-            assert_eq!(query_result.as_slice(), b"{\"allowance\":\"0\"}");
+
+            let info = mock_info("creator", &[]);
+
+            instantiate(deps.as_mut(), mock_env(), info.clone(), instantiate_msg).unwrap();
+
+            let res = execute(
+                deps.as_mut(),
+                mock_env(),
+                info,
+                ExecuteMsg::UpdateMarketing {
+                    project: None,
+                    description: Some("Better description".to_owned()),
+                    marketing: None,
+                },
+            )
+            .unwrap();
+
+            assert_eq!(res.messages, vec![]);
+
+            assert_eq!(
+                query_marketing_info(deps.as_ref()).unwrap(),
+                MarketingInfoResponse {
+                    project: Some("Project".to_owned()),
+                    description: Some("Better description".to_owned()),
+                    marketing: Some(Addr::unchecked("creator")),
+                    logo: Some(LogoInfo::Url("url".to_owned())),
+                }
+            );
+
+            let err = query_download_logo(deps.as_ref()).unwrap_err();
+            assert!(
+                matches!(err, StdError::NotFound { .. }),
+                "Expected StdError::NotFound, received {}",
+                err
+            );
+        }
+
+        #[test]
+        fn clear_description() {
+            let mut deps = mock_dependencies();
+            let instantiate_msg = InstantiateMsg {
+                name: "Cash Token".to_string(),
+                symbol: "CASH".to_string(),
+                decimals: 9,
+                initial_balances: vec![],
+                mint: None,
+                marketing: Some(InstantiateMarketingInfo {
+                    project: Some("Project".to_owned()),
+                    description: Some("Description".to_owned()),
+                    marketing: Some("creator".to_owned()),
+                    logo: Some(Logo::Url("url".to_owned())),
+                }),
+            };
+
+            let info = mock_info("creator", &[]);
+
+            instantiate(deps.as_mut(), mock_env(), info.clone(), instantiate_msg).unwrap();
+
+            let res = execute(
+                deps.as_mut(),
+                mock_env(),
+                info,
+                ExecuteMsg::UpdateMarketing {
+                    project: None,
+                    description: Some("".to_owned()),
+                    marketing: None,
+                },
+            )
+            .unwrap();
+
+            assert_eq!(res.messages, vec![]);
+
+            assert_eq!(
+                query_marketing_info(deps.as_ref()).unwrap(),
+                MarketingInfoResponse {
+                    project: Some("Project".to_owned()),
+                    description: None,
+                    marketing: Some(Addr::unchecked("creator")),
+                    logo: Some(LogoInfo::Url("url".to_owned())),
+                }
+            );
+
+            let err = query_download_logo(deps.as_ref()).unwrap_err();
+            assert!(
+                matches!(err, StdError::NotFound { .. }),
+                "Expected StdError::NotFound, received {}",
+                err
+            );
+        }
+
+        #[test]
+        fn update_marketing() {
+            let mut deps = mock_dependencies();
+            let instantiate_msg = InstantiateMsg {
+                name: "Cash Token".to_string(),
+                symbol: "CASH".to_string(),
+                decimals: 9,
+                initial_balances: vec![],
+                mint: None,
+                marketing: Some(InstantiateMarketingInfo {
+                    project: Some("Project".to_owned()),
+                    description: Some("Description".to_owned()),
+                    marketing: Some("creator".to_owned()),
+                    logo: Some(Logo::Url("url".to_owned())),
+                }),
+            };
+
+            let info = mock_info("creator", &[]);
+
+            instantiate(deps.as_mut(), mock_env(), info.clone(), instantiate_msg).unwrap();
+
+            let res = execute(
+                deps.as_mut(),
+                mock_env(),
+                info,
+                ExecuteMsg::UpdateMarketing {
+                    project: None,
+                    description: None,
+                    marketing: Some("marketing".to_owned()),
+                },
+            )
+            .unwrap();
+
+            assert_eq!(res.messages, vec![]);
+
+            assert_eq!(
+                query_marketing_info(deps.as_ref()).unwrap(),
+                MarketingInfoResponse {
+                    project: Some("Project".to_owned()),
+                    description: Some("Description".to_owned()),
+                    marketing: Some(Addr::unchecked("marketing")),
+                    logo: Some(LogoInfo::Url("url".to_owned())),
+                }
+            );
+
+            let err = query_download_logo(deps.as_ref()).unwrap_err();
+            assert!(
+                matches!(err, StdError::NotFound { .. }),
+                "Expected StdError::NotFound, received {}",
+                err
+            );
+        }
+
+        #[test]
+        fn update_marketing_invalid() {
+            let mut deps = mock_dependencies();
+            let instantiate_msg = InstantiateMsg {
+                name: "Cash Token".to_string(),
+                symbol: "CASH".to_string(),
+                decimals: 9,
+                initial_balances: vec![],
+                mint: None,
+                marketing: Some(InstantiateMarketingInfo {
+                    project: Some("Project".to_owned()),
+                    description: Some("Description".to_owned()),
+                    marketing: Some("creator".to_owned()),
+                    logo: Some(Logo::Url("url".to_owned())),
+                }),
+            };
+
+            let info = mock_info("creator", &[]);
+
+            instantiate(deps.as_mut(), mock_env(), info.clone(), instantiate_msg).unwrap();
+
+            let err = execute(
+                deps.as_mut(),
+                mock_env(),
+                info,
+                ExecuteMsg::UpdateMarketing {
+                    project: None,
+                    description: None,
+                    marketing: Some("m".to_owned()),
+                },
+            )
+            .unwrap_err();
+
+            assert!(
+                matches!(err, ContractError::Std(_)),
+                "Expected Std error, received: {}",
+                err
+            );
+
+            assert_eq!(
+                query_marketing_info(deps.as_ref()).unwrap(),
+                MarketingInfoResponse {
+                    project: Some("Project".to_owned()),
+                    description: Some("Description".to_owned()),
+                    marketing: Some(Addr::unchecked("creator")),
+                    logo: Some(LogoInfo::Url("url".to_owned())),
+                }
+            );
+
+            let err = query_download_logo(deps.as_ref()).unwrap_err();
+            assert!(
+                matches!(err, StdError::NotFound { .. }),
+                "Expected StdError::NotFound, received {}",
+                err
+            );
+        }
+
+        #[test]
+        fn clear_marketing() {
+            let mut deps = mock_dependencies();
+            let instantiate_msg = InstantiateMsg {
+                name: "Cash Token".to_string(),
+                symbol: "CASH".to_string(),
+                decimals: 9,
+                initial_balances: vec![],
+                mint: None,
+                marketing: Some(InstantiateMarketingInfo {
+                    project: Some("Project".to_owned()),
+                    description: Some("Description".to_owned()),
+                    marketing: Some("creator".to_owned()),
+                    logo: Some(Logo::Url("url".to_owned())),
+                }),
+            };
+
+            let info = mock_info("creator", &[]);
+
+            instantiate(deps.as_mut(), mock_env(), info.clone(), instantiate_msg).unwrap();
+
+            let res = execute(
+                deps.as_mut(),
+                mock_env(),
+                info,
+                ExecuteMsg::UpdateMarketing {
+                    project: None,
+                    description: None,
+                    marketing: Some("".to_owned()),
+                },
+            )
+            .unwrap();
+
+            assert_eq!(res.messages, vec![]);
+
+            assert_eq!(
+                query_marketing_info(deps.as_ref()).unwrap(),
+                MarketingInfoResponse {
+                    project: Some("Project".to_owned()),
+                    description: Some("Description".to_owned()),
+                    marketing: None,
+                    logo: Some(LogoInfo::Url("url".to_owned())),
+                }
+            );
+
+            let err = query_download_logo(deps.as_ref()).unwrap_err();
+            assert!(
+                matches!(err, StdError::NotFound { .. }),
+                "Expected StdError::NotFound, received {}",
+                err
+            );
+        }
+
+        #[test]
+        fn update_logo_url() {
+            let mut deps = mock_dependencies();
+            let instantiate_msg = InstantiateMsg {
+                name: "Cash Token".to_string(),
+                symbol: "CASH".to_string(),
+                decimals: 9,
+                initial_balances: vec![],
+                mint: None,
+                marketing: Some(InstantiateMarketingInfo {
+                    project: Some("Project".to_owned()),
+                    description: Some("Description".to_owned()),
+                    marketing: Some("creator".to_owned()),
+                    logo: Some(Logo::Url("url".to_owned())),
+                }),
+            };
+
+            let info = mock_info("creator", &[]);
+
+            instantiate(deps.as_mut(), mock_env(), info.clone(), instantiate_msg).unwrap();
+
+            let res = execute(
+                deps.as_mut(),
+                mock_env(),
+                info,
+                ExecuteMsg::UploadLogo(Logo::Url("new_url".to_owned())),
+            )
+            .unwrap();
+
+            assert_eq!(res.messages, vec![]);
+
+            assert_eq!(
+                query_marketing_info(deps.as_ref()).unwrap(),
+                MarketingInfoResponse {
+                    project: Some("Project".to_owned()),
+                    description: Some("Description".to_owned()),
+                    marketing: Some(Addr::unchecked("creator")),
+                    logo: Some(LogoInfo::Url("new_url".to_owned())),
+                }
+            );
+
+            let err = query_download_logo(deps.as_ref()).unwrap_err();
+            assert!(
+                matches!(err, StdError::NotFound { .. }),
+                "Expected StdError::NotFound, received {}",
+                err
+            );
+        }
+
+        #[test]
+        fn update_logo_png() {
+            let mut deps = mock_dependencies();
+            let instantiate_msg = InstantiateMsg {
+                name: "Cash Token".to_string(),
+                symbol: "CASH".to_string(),
+                decimals: 9,
+                initial_balances: vec![],
+                mint: None,
+                marketing: Some(InstantiateMarketingInfo {
+                    project: Some("Project".to_owned()),
+                    description: Some("Description".to_owned()),
+                    marketing: Some("creator".to_owned()),
+                    logo: Some(Logo::Url("url".to_owned())),
+                }),
+            };
+
+            let info = mock_info("creator", &[]);
+
+            instantiate(deps.as_mut(), mock_env(), info.clone(), instantiate_msg).unwrap();
+
+            let res = execute(
+                deps.as_mut(),
+                mock_env(),
+                info,
+                ExecuteMsg::UploadLogo(Logo::Embedded(EmbeddedLogo::Png(PNG_HEADER.into()))),
+            )
+            .unwrap();
+
+            assert_eq!(res.messages, vec![]);
+
+            assert_eq!(
+                query_marketing_info(deps.as_ref()).unwrap(),
+                MarketingInfoResponse {
+                    project: Some("Project".to_owned()),
+                    description: Some("Description".to_owned()),
+                    marketing: Some(Addr::unchecked("creator")),
+                    logo: Some(LogoInfo::Embedded),
+                }
+            );
+
+            assert_eq!(
+                query_download_logo(deps.as_ref()).unwrap(),
+                DownloadLogoResponse {
+                    mime_type: "image/png".to_owned(),
+                    data: PNG_HEADER.into(),
+                }
+            );
+        }
+
+        #[test]
+        fn update_logo_svg() {
+            let mut deps = mock_dependencies();
+            let instantiate_msg = InstantiateMsg {
+                name: "Cash Token".to_string(),
+                symbol: "CASH".to_string(),
+                decimals: 9,
+                initial_balances: vec![],
+                mint: None,
+                marketing: Some(InstantiateMarketingInfo {
+                    project: Some("Project".to_owned()),
+                    description: Some("Description".to_owned()),
+                    marketing: Some("creator".to_owned()),
+                    logo: Some(Logo::Url("url".to_owned())),
+                }),
+            };
+
+            let info = mock_info("creator", &[]);
+
+            instantiate(deps.as_mut(), mock_env(), info.clone(), instantiate_msg).unwrap();
+
+            let img = "<?xml version=\"1.0\"?><svg></svg>".as_bytes();
+            let res = execute(
+                deps.as_mut(),
+                mock_env(),
+                info,
+                ExecuteMsg::UploadLogo(Logo::Embedded(EmbeddedLogo::Svg(img.into()))),
+            )
+            .unwrap();
+
+            assert_eq!(res.messages, vec![]);
+
+            assert_eq!(
+                query_marketing_info(deps.as_ref()).unwrap(),
+                MarketingInfoResponse {
+                    project: Some("Project".to_owned()),
+                    description: Some("Description".to_owned()),
+                    marketing: Some(Addr::unchecked("creator")),
+                    logo: Some(LogoInfo::Embedded),
+                }
+            );
+
+            assert_eq!(
+                query_download_logo(deps.as_ref()).unwrap(),
+                DownloadLogoResponse {
+                    mime_type: "image/svg+xml".to_owned(),
+                    data: img.into(),
+                }
+            );
+        }
+
+        #[test]
+        fn update_logo_png_oversized() {
+            let mut deps = mock_dependencies();
+            let instantiate_msg = InstantiateMsg {
+                name: "Cash Token".to_string(),
+                symbol: "CASH".to_string(),
+                decimals: 9,
+                initial_balances: vec![],
+                mint: None,
+                marketing: Some(InstantiateMarketingInfo {
+                    project: Some("Project".to_owned()),
+                    description: Some("Description".to_owned()),
+                    marketing: Some("creator".to_owned()),
+                    logo: Some(Logo::Url("url".to_owned())),
+                }),
+            };
+
+            let info = mock_info("creator", &[]);
+
+            instantiate(deps.as_mut(), mock_env(), info.clone(), instantiate_msg).unwrap();
+
+            let img = [&PNG_HEADER[..], &[1; 6000][..]].concat();
+            let err = execute(
+                deps.as_mut(),
+                mock_env(),
+                info,
+                ExecuteMsg::UploadLogo(Logo::Embedded(EmbeddedLogo::Png(img.into()))),
+            )
+            .unwrap_err();
+
+            assert_eq!(err, ContractError::LogoTooBig {});
+
+            assert_eq!(
+                query_marketing_info(deps.as_ref()).unwrap(),
+                MarketingInfoResponse {
+                    project: Some("Project".to_owned()),
+                    description: Some("Description".to_owned()),
+                    marketing: Some(Addr::unchecked("creator")),
+                    logo: Some(LogoInfo::Url("url".to_owned())),
+                }
+            );
+
+            let err = query_download_logo(deps.as_ref()).unwrap_err();
+            assert!(
+                matches!(err, StdError::NotFound { .. }),
+                "Expected StdError::NotFound, received {}",
+                err
+            );
+        }
+
+        #[test]
+        fn update_logo_svg_oversized() {
+            let mut deps = mock_dependencies();
+            let instantiate_msg = InstantiateMsg {
+                name: "Cash Token".to_string(),
+                symbol: "CASH".to_string(),
+                decimals: 9,
+                initial_balances: vec![],
+                mint: None,
+                marketing: Some(InstantiateMarketingInfo {
+                    project: Some("Project".to_owned()),
+                    description: Some("Description".to_owned()),
+                    marketing: Some("creator".to_owned()),
+                    logo: Some(Logo::Url("url".to_owned())),
+                }),
+            };
+
+            let info = mock_info("creator", &[]);
+
+            instantiate(deps.as_mut(), mock_env(), info.clone(), instantiate_msg).unwrap();
+
+            let img = [
+                "<?xml version=\"1.0\"?><svg>",
+                std::str::from_utf8(&[b'x'; 6000]).unwrap(),
+                "</svg>",
+            ]
+            .concat()
+            .into_bytes();
+
+            let err = execute(
+                deps.as_mut(),
+                mock_env(),
+                info,
+                ExecuteMsg::UploadLogo(Logo::Embedded(EmbeddedLogo::Svg(img.into()))),
+            )
+            .unwrap_err();
+
+            assert_eq!(err, ContractError::LogoTooBig {});
+
+            assert_eq!(
+                query_marketing_info(deps.as_ref()).unwrap(),
+                MarketingInfoResponse {
+                    project: Some("Project".to_owned()),
+                    description: Some("Description".to_owned()),
+                    marketing: Some(Addr::unchecked("creator")),
+                    logo: Some(LogoInfo::Url("url".to_owned())),
+                }
+            );
+
+            let err = query_download_logo(deps.as_ref()).unwrap_err();
+            assert!(
+                matches!(err, StdError::NotFound { .. }),
+                "Expected StdError::NotFound, received {}",
+                err
+            );
+        }
+
+        #[test]
+        fn update_logo_png_invalid() {
+            let mut deps = mock_dependencies();
+            let instantiate_msg = InstantiateMsg {
+                name: "Cash Token".to_string(),
+                symbol: "CASH".to_string(),
+                decimals: 9,
+                initial_balances: vec![],
+                mint: None,
+                marketing: Some(InstantiateMarketingInfo {
+                    project: Some("Project".to_owned()),
+                    description: Some("Description".to_owned()),
+                    marketing: Some("creator".to_owned()),
+                    logo: Some(Logo::Url("url".to_owned())),
+                }),
+            };
+
+            let info = mock_info("creator", &[]);
+
+            instantiate(deps.as_mut(), mock_env(), info.clone(), instantiate_msg).unwrap();
+
+            let img = &[1];
+            let err = execute(
+                deps.as_mut(),
+                mock_env(),
+                info,
+                ExecuteMsg::UploadLogo(Logo::Embedded(EmbeddedLogo::Png(img.into()))),
+            )
+            .unwrap_err();
+
+            assert_eq!(err, ContractError::InvalidPngHeader {});
+
+            assert_eq!(
+                query_marketing_info(deps.as_ref()).unwrap(),
+                MarketingInfoResponse {
+                    project: Some("Project".to_owned()),
+                    description: Some("Description".to_owned()),
+                    marketing: Some(Addr::unchecked("creator")),
+                    logo: Some(LogoInfo::Url("url".to_owned())),
+                }
+            );
+
+            let err = query_download_logo(deps.as_ref()).unwrap_err();
+            assert!(
+                matches!(err, StdError::NotFound { .. }),
+                "Expected StdError::NotFound, received {}",
+                err
+            );
+        }
+
+        #[test]
+        fn update_logo_svg_invalid() {
+            let mut deps = mock_dependencies();
+            let instantiate_msg = InstantiateMsg {
+                name: "Cash Token".to_string(),
+                symbol: "CASH".to_string(),
+                decimals: 9,
+                initial_balances: vec![],
+                mint: None,
+                marketing: Some(InstantiateMarketingInfo {
+                    project: Some("Project".to_owned()),
+                    description: Some("Description".to_owned()),
+                    marketing: Some("creator".to_owned()),
+                    logo: Some(Logo::Url("url".to_owned())),
+                }),
+            };
+
+            let info = mock_info("creator", &[]);
+
+            instantiate(deps.as_mut(), mock_env(), info.clone(), instantiate_msg).unwrap();
+
+            let img = &[1];
+
+            let err = execute(
+                deps.as_mut(),
+                mock_env(),
+                info,
+                ExecuteMsg::UploadLogo(Logo::Embedded(EmbeddedLogo::Svg(img.into()))),
+            )
+            .unwrap_err();
+
+            assert_eq!(err, ContractError::InvalidXmlPreamble {});
+
+            assert_eq!(
+                query_marketing_info(deps.as_ref()).unwrap(),
+                MarketingInfoResponse {
+                    project: Some("Project".to_owned()),
+                    description: Some("Description".to_owned()),
+                    marketing: Some(Addr::unchecked("creator")),
+                    logo: Some(LogoInfo::Url("url".to_owned())),
+                }
+            );
+
+            let err = query_download_logo(deps.as_ref()).unwrap_err();
+            assert!(
+                matches!(err, StdError::NotFound { .. }),
+                "Expected StdError::NotFound, received {}",
+                err
+            );
         }
     }
 }
