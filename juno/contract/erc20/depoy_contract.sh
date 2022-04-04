@@ -5,7 +5,7 @@ NODE="https://rpc.uni.juno.deuslabs.fi:443"
 #ACCOUNT="test"
 ACCOUNT="hieuvu"
 CHAINID="uni-2"
-CONTRACT_DIR="artifacts/cw_erc20.wasm"
+CONTRACT_DIR="artifacts/cw20_base.wasm"
 SLEEP_TIME="15s"
 
 RES=$(junod tx wasm store "$CONTRACT_DIR" --from "$ACCOUNT" -y --output json --node "$NODE" --gas 35000000 --fees 100000ujunox -y --output json)
